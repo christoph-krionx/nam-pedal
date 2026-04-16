@@ -1,39 +1,26 @@
 TARGET = NAMPedal
 
+GCC_PATH = /Library/DaisyToolchain/0.2.0/arm/bin
+
 LIBDAISY_DIR = ../../libDaisy
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 
-CPP_SOURCES = \
-  NAMPedal.cpp \
-  nam-binary-loader/namb/get_dsp_namb.cpp \
-  NeuralAmpModelerCore/NAM/activations.cpp \
-  NeuralAmpModelerCore/NAM/conv1d.cpp \
-  NeuralAmpModelerCore/NAM/convnet.cpp \
-  NeuralAmpModelerCore/NAM/dsp.cpp \
-  NeuralAmpModelerCore/NAM/get_dsp.cpp \
-  NeuralAmpModelerCore/NAM/lstm.cpp \
-  NeuralAmpModelerCore/NAM/ring_buffer.cpp \
-  NeuralAmpModelerCore/NAM/util.cpp \
-  NeuralAmpModelerCore/NAM/wavenet.cpp
+CPP_SOURCES = NAMPedal.cpp
+C_SOURCES = nam_model.c
 
-C_INCLUDES = \
-  -I. \
-  -INeuralAmpModelerCore \
-  -INeuralAmpModelerCore/Dependencies/eigen \
-  -INeuralAmpModelerCore/Dependencies/nlohmann \
-  -Inam-binary-loader
-
-C_DEFS = \
-  -DNAM_SAMPLE_FLOAT \
-  -DNAM_USE_INLINE_GEMM \
-  -D__ARM_ARCH_7EM__
+C_INCLUDES = -I.
 
 USE_FATFS = 1
 APP_TYPE = BOOT_QSPI
 CPP_STANDARD = -std=gnu++17
-OPT = -O3
+OPT = -O2
 LDFLAGS = -u _printf_float
 
 include $(SYSTEM_FILES_DIR)/Makefile
 
-CPPFLAGS += -fexceptions -ffast-math -funroll-loops -ftree-vectorize -fmove-loop-invariants
+# Daisy audio block size is 48 frames — must match NAMPedal.cpp SetAudioBlockSize.
+# NAM_DTCM places weights and small ring buffers in fast DTCM (Cortex-M7).
+CFLAGS   += -ffast-math -fno-unroll-loops -ftree-vectorize \
+            -DNAM_MAX_BUFFER_SIZE=48 \
+            -DNAM_DTCM='__attribute__((section(".dtcmram_bss")))'
+CPPFLAGS += -DNAM_MAX_BUFFER_SIZE=48

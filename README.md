@@ -1,6 +1,8 @@
-# NAMPedal
+# NAMPedal (A2-nano)
 
-A guitar amp modeler pedal for the [Daisy Pod](https://www.electro-smith.com/daisy/pod) running [Neural Amp Modeler](https://github.com/sdatkinson/NeuralAmpModelerCore) (NAM) models. It loads `.namb` binary model files from an SD card and provides two knobs for gain (input level) and volume (output level).
+A guitar amp modeler pedal for the [Daisy Pod](https://www.electro-smith.com/daisy/pod) running Neural Amp Modeler (NAM) models of the **A2-nano** architecture. It loads `.namb` binary model files from an SD card and provides two knobs for gain (input level) and volume (output level).
+
+Inference uses hand-tuned, dependency-free C code specialized for the A2-nano WaveNet architecture and optimized for embedded Cortex-M7 targets. There is no dependency on the NeuralAmpModelerCore C++ library at build or runtime. Any A2-nano `.namb` whose weights match the fixed architecture can be swapped in at runtime.
 
 ## Motivation
 
@@ -37,14 +39,9 @@ cd ..
 
 ```bash
 cd seed
-git clone --recursive https://github.com/tone-3000/NAMPedal
+git clone -b a2-nano https://github.com/tone-3000/NAMPedal
 cd NAMPedal
 ```
-
-The `--recursive` flag pulls in the two submodules:
-
-- **NeuralAmpModelerCore** — DSP engine (LSTM, WaveNet, ConvNet architectures)
-- **nam-binary-loader** — `.namb` binary model parser
 
 ## Building
 
@@ -151,61 +148,70 @@ Once the serial terminal is connected you will see boot messages, model loading
 status, a one-shot benchmark, and a once-per-second diagnostics line:
 
 ```
-NAMPedal: booting...
+NAMPedal (A2-nano C): booting...
 FS mount: OK
-Loading model: nano_relu.namb
-  file size: 1756 bytes
-  read OK (1756 bytes)
-  model ready (12 ms)
-Benchmark: 142350 cycles for 48 frames (budget=480000)
-  0.30 ms (deadline 1.00 ms)
+Loading model: model.namb
+  file size: 7516 bytes
+  read OK (7516 bytes)
+  weights: offset=32 count=1871
+  prewarming (6332 samples)...
+  model ready (XX ms)
+Model load: OK
+Benchmark: XXXXXX cycles for 48 frames (budget=480000)
+  X.XX ms (deadline 1.00 ms)
 Audio engine started
-cb=48  cycles=142200  max=142350  gain=0.500  vol=0.750  BYPASS
+cb=48  cycles=XXXXX  max=XXXXX  gain=0.500  vol=0.750  BYPASS
 ```
 
 ### Getting a NAM Model
 
-The firmware loads a `.namb` (binary) model file from the SD card. Most NAM
-models are distributed as `.nam` (JSON) files, so you need to convert them
-first.
+The firmware loads a `.namb` (binary) model file from the SD card. A2-nano
+`.nam` models are distributed as JSON, so you need to convert them to `.namb`
+first. The expected payload is exactly 1871 float32 weights (7484 bytes) plus
+the 32-byte `.namb` header.
 
-#### 1. Download a model
+> **Note:** Only A2-nano models are supported. The inference code is
+> specialized at build time for a single WaveNet architecture (1 layer array,
+> channels=3, bottleneck=3, kernel sizes [6, 15], 23 layers, head kernel=16).
+> Any other architecture will be rejected by `nam_load_weights()` at load
+> time.
 
-Download the **nano relu** version of the
-[Fender '65 Deluxe Reverb Boosted with Klon](https://www.tone3000.com/tones/fender-65-deluxe-reverb-boosted-with-klon-43185)
-model from Tone3000. The nano relu architecture is small enough to fit within
-the 4 KB model buffer and fast enough to run in real time on the Daisy.
+#### 1. Obtain an A2-nano `.nam` model
 
-> **Note:** Only `nano` (and some `feather`) models are small and fast enough
-> for the Daisy's Cortex-M7. Larger architectures (standard, lite) will either
-> exceed the file size limit or miss the 1 ms audio deadline.
+Start from any A2-nano-shaped `.nam` file you have trained or been given.
+Other architectures (nano, feather, standard, etc.) are **not** compatible
+with this firmware.
 
 #### 2. Convert `.nam` to `.namb`
 
-The `nam-binary-loader` submodule includes a converter tool. Build it from the
-repository root:
+The converter lives in the
+[nam-binary-loader](https://github.com/tone-3000/nam-binary-loader) repository
+(external — not a submodule of this repo). Clone and build it somewhere
+outside this project:
 
 ```bash
+git clone https://github.com/tone-3000/nam-binary-loader
 cd nam-binary-loader
 mkdir build && cd build
-cmake .. -DNAM_CORE_PATH=../../NeuralAmpModelerCore
-make
+cmake .. -DNAM_CORE_PATH=/path/to/NeuralAmpModelerCore
+make nam2namb
 ```
 
-Then convert your downloaded model:
+(`nam2namb` itself depends on NeuralAmpModelerCore to parse the JSON — point
+`NAM_CORE_PATH` at a local checkout of that repo.) Then convert your model:
 
 ```bash
-./nam2namb /path/to/downloaded-model.nam nano_relu.namb
+./nam2namb /path/to/your-a2-nano-model.nam model.namb
 ```
 
 #### 3. Copy to SD card
 
-Copy the resulting `nano_relu.namb` file to the root of a FAT32-formatted micro
+Copy the resulting `model.namb` file to the root of a FAT32-formatted micro
 SD card.
 
 ### Running the Pedal
 
-1. Insert the SD card (with `nano_relu.namb` at the root) into the Daisy Pod
+1. Insert the SD card (with `model.namb` at the root) into the Daisy Pod
 2. Connect the Daisy Pod to your computer via USB and open a serial terminal (see above)
 3. Power on or reset the board — the serial terminal must be open **before** this step
 4. Wait for the `Audio engine started` message in the serial output
@@ -230,14 +236,15 @@ SD card.
 |---------|-------|-----|
 | Board appears dead after flashing | No serial terminal connected; firmware is waiting for USB | Connect a serial terminal, then reset the board |
 | `FS mount: FAILED` in serial output | SD card not inserted, not FAT32, or bad contact | Re-format the SD card as FAT32 and re-insert |
-| `f_open failed` | Model file missing or wrong filename | Ensure the file is named `nano_relu.namb` at the root of the SD card |
-| `file too large` | Model exceeds the 4 KB buffer | Use a smaller model (e.g. a `nano` or `feather` variant exported with NAM) |
-| Audio glitches / dropouts | Model inference exceeds the 1 ms per-block deadline | Use a smaller/simpler model architecture; check the benchmark output |
+| `f_open failed` | Model file missing or wrong filename | Ensure the file is named `model.namb` at the root of the SD card |
+| `file too large` | Model exceeds the 8 KB SD read buffer | Only A2-nano models (~7.5 KB) are supported; any larger architecture will hit this |
+| `nam_load_weights failed (not an A2-nano model?)` | `.namb` weight count is not 1871 | Regenerate the `.namb` from an A2-nano `.nam` model |
+| Audio glitches / dropouts | Model inference exceeds the 1 ms per-block deadline | Confirm the firmware was built with `-O2` and the DaisyToolchain; check the startup benchmark output |
 
 ## How it Works
 
 - Audio is processed mono — the left input channel is fed through the NAM model and the output is duplicated to both stereo channels
-- The model is loaded once at startup from the SD card into RAM, then `prewarm()` is called to stabilize initial state
-- `NAM_SAMPLE` is defined as `float` (via `NAM_SAMPLE_FLOAT`) to match Daisy's audio buffers and halve memory usage compared to double precision
+- The model is loaded once at startup from the SD card: `nam_init()` initialises state, `nam_load_weights()` ingests the 1871 float32 weights from the `.namb` payload, and the prewarm loop pushes 6332 samples of silence through to fill the WaveNet receptive field
+- Inference runs in hand-tuned C specialized for the A2-nano architecture: fused sample-at-a-time layers, power-of-2 circular ring buffers, unrolled operations for specific kernel sizes. Weights and the frequently-accessed small ring buffers live in DTCM; the largest ring buffers (dilation=239) live in AXI SRAM with anti-aliasing padding between them
 - The audio block size is 48 samples at 48 kHz, giving a 1 ms processing deadline per block
 - FPU Flush-to-Zero and Default-NaN modes are enabled to avoid costly denormal handling on the Cortex-M7

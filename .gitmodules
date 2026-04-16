@@ -1,6 +1,0 @@
-[submodule "NeuralAmpModelerCore"]
-	path = NeuralAmpModelerCore
-	url = https://github.com/sdatkinson/NeuralAmpModelerCore.git
-[submodule "nam-binary-loader"]
-	path = nam-binary-loader
-	url = https://github.com/tone-3000/nam-binary-loader.git
