@@ -1,6 +1,6 @@
 # NAMPedal (A2-nano)
 
-A guitar amp modeler pedal for the [Daisy Pod](https://www.electro-smith.com/daisy/pod) running Neural Amp Modeler (NAM) models of the **A2-nano** architecture. It loads `.namb` binary model files from an SD card and provides two knobs for gain (input level) and volume (output level).
+A guitar amp modeler pedal for the [PedalPCB Terrarium](https://www.pedalpcb.com/product/pcb351/) (a [Daisy Seed](https://www.electro-smith.com/daisy/daisy) platform) running Neural Amp Modeler (NAM) models of the **A2-nano** architecture. The `.namb` binary model is embedded in flash at build time, and the pedal provides input gain, output volume, and a 3-band EQ (bass/mid/treble), plus a footswitch-toggled bypass.
 
 Inference uses hand-tuned, dependency-free C code specialized for the A2-nano WaveNet architecture and optimized for embedded Cortex-M7 targets. There is no dependency on the NeuralAmpModelerCore C++ library at build or runtime. Any A2-nano `.namb` whose weights match the fixed architecture can be swapped in at runtime.
 
@@ -11,7 +11,7 @@ This was created as a helpful blueprint to guide the creation of embedded device
 ## Prerequisites
 
 - [DaisyToolchain](https://github.com/electro-smith/DaisyToolchain) — ARM cross-compiler and tools for the Daisy platform
-- A Daisy Pod board with a micro SD card
+- A PedalPCB Terrarium (Daisy Seed) board
 - A USB cable and serial terminal application (see note above)
 
 > **Important — USB serial terminal required:** The firmware currently waits
@@ -55,7 +55,7 @@ This cross-compiles for the STM32H750 (Cortex-M7) using `BOOT_QSPI` app type for
 
 Because this app leverages Daisy's QSPI flash memory to accommodate program size, a *bootloader* must be flashed before the main program.
 
-To install a bootloader, put the Daisy Pod into DFU mode (hold BOOT, press RESET), then:
+To install a bootloader, put the Daisy Seed into DFU mode (hold BOOT, press RESET), then:
 
 ```bash
 make program-boot
@@ -149,10 +149,8 @@ status, a one-shot benchmark, and a once-per-second diagnostics line:
 
 ```
 NAMPedal (A2-nano C): booting...
-FS mount: OK
-Loading model: model.namb
-  file size: 7516 bytes
-  read OK (7516 bytes)
+Loading embedded model
+  embedded model: 7516 bytes
   weights: offset=32 count=1871
   prewarming (6332 samples)...
   model ready (XX ms)
@@ -160,15 +158,18 @@ Model load: OK
 Benchmark: XXXXXX cycles for 48 frames (budget=480000)
   X.XX ms (deadline 1.00 ms)
 Audio engine started
-cb=48  cycles=XXXXX  max=XXXXX  gain=0.500  vol=0.750  BYPASS
+cb=48  cycles=XXXXX  max=XXXXX  gain=1.00  vol=0.75  eq[0.0 0.0 0.0]  BYPASS
 ```
 
 ### Getting a NAM Model
 
-The firmware loads a `.namb` (binary) model file from the SD card. A2-nano
-`.nam` models are distributed as JSON, so you need to convert them to `.namb`
-first. The expected payload is exactly 1871 float32 weights (7484 bytes) plus
-the 32-byte `.namb` header.
+The Terrarium has no SD card slot, so the model is **embedded in the firmware
+and compiled into QSPI flash**. The build embeds whatever `model.namb` is
+present in the project directory (via `gen_model_data.py`, which produces
+`model_data.h`); swap in a different `model.namb` and rebuild to change models.
+A2-nano `.nam` models are distributed as JSON, so you need to convert them to
+`.namb` first. The expected payload is exactly 1871 float32 weights (7484
+bytes) plus the 32-byte `.namb` header.
 
 > **Note:** Only A2-nano models are supported. The inference code is
 > specialized at build time for a single WaveNet architecture (1 layer array,
@@ -204,47 +205,53 @@ make nam2namb
 ./nam2namb /path/to/your-a2-nano-model.nam model.namb
 ```
 
-#### 3. Copy to SD card
+#### 3. Place `model.namb` and rebuild
 
-Copy the resulting `model.namb` file to the root of a FAT32-formatted micro
-SD card.
+Copy the resulting `model.namb` into the project directory (next to the
+`Makefile`), replacing the existing one, then rebuild and reflash. The build
+regenerates `model_data.h` and compiles the model into flash automatically.
 
 ### Running the Pedal
 
-1. Insert the SD card (with `model.namb` at the root) into the Daisy Pod
-2. Connect the Daisy Pod to your computer via USB and open a serial terminal (see above)
+1. Build and flash the firmware (with your `model.namb` embedded — see above)
+2. Connect the Daisy Seed to your computer via USB and open a serial terminal (see above)
 3. Power on or reset the board — the serial terminal must be open **before** this step
 4. Wait for the `Audio engine started` message in the serial output
 5. Connect your guitar to the audio input and an amp/headphones to the audio output
 
 ### Controls
 
-| Control  | Function                                  |
-|----------|-------------------------------------------|
-| KNOB 1   | Gain (input level)                        |
-| KNOB 2   | Volume (output level)                     |
-| Button 1 | Toggle bypass (red LED = bypass, green LED = active) |
+| Control       | Function                          |
+|---------------|-----------------------------------|
+| KNOB 1        | Input gain (noon ≈ unity)         |
+| KNOB 2        | Output volume                     |
+| KNOB 3        | (unused)                          |
+| KNOB 4        | Bass (±12 dB, noon = flat)        |
+| KNOB 5        | Mid (±12 dB, noon = flat)         |
+| KNOB 6        | Treble (±12 dB, noon = flat)      |
+| FOOTSWITCH 1  | Toggle bypass                     |
+
+Signal chain: input gain → NAM model → 3-band EQ → output volume.
 
 ### LED Indicator
 
-- **Red** — Effect is bypassed (clean passthrough)
-- **Green** — Effect is active (NAM model processing)
+- **LED 1 off** — Effect is bypassed (clean passthrough)
+- **LED 1 on** — Effect is active (NAM model + EQ processing)
 
 ### Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Board appears dead after flashing | No serial terminal connected; firmware is waiting for USB | Connect a serial terminal, then reset the board |
-| `FS mount: FAILED` in serial output | SD card not inserted, not FAT32, or bad contact | Re-format the SD card as FAT32 and re-insert |
-| `f_open failed` | Model file missing or wrong filename | Ensure the file is named `model.namb` at the root of the SD card |
-| `file too large` | Model exceeds the 8 KB SD read buffer | Only A2-nano models (~7.5 KB) are supported; any larger architecture will hit this |
+| `Model load: FAILED` with `bad magic` | `model.namb` is not a valid `.namb` file | Regenerate `model.namb` with `nam2namb` and rebuild |
+| `nam_load_weights failed` | `.namb` weight count is not 1871 | Embed an A2-nano `model.namb` (exactly 1871 weights) and rebuild |
 | `nam_load_weights failed (not an A2-nano model?)` | `.namb` weight count is not 1871 | Regenerate the `.namb` from an A2-nano `.nam` model |
 | Audio glitches / dropouts | Model inference exceeds the 1 ms per-block deadline | Confirm the firmware was built with `-O2` and the DaisyToolchain; check the startup benchmark output |
 
 ## How it Works
 
 - Audio is processed mono — the left input channel is fed through the NAM model and the output is duplicated to both stereo channels
-- The model is loaded once at startup from the SD card: `nam_init()` initialises state, `nam_load_weights()` ingests the 1871 float32 weights from the `.namb` payload, and the prewarm loop pushes 6332 samples of silence through to fill the WaveNet receptive field
+- The model is loaded once at startup from the flash-embedded `.namb`: `nam_init()` initialises state, `nam_load_weights()` ingests the 1871 float32 weights from the `.namb` payload, and the prewarm loop pushes 6332 samples of silence through to fill the WaveNet receptive field
 - Inference runs in hand-tuned C specialized for the A2-nano architecture: fused sample-at-a-time layers, power-of-2 circular ring buffers, unrolled operations for specific kernel sizes. Weights and the frequently-accessed small ring buffers live in DTCM; the largest ring buffers (dilation=239) live in AXI SRAM with anti-aliasing padding between them
 - The audio block size is 48 samples at 48 kHz, giving a 1 ms processing deadline per block
 - FPU Flush-to-Zero and Default-NaN modes are enabled to avoid costly denormal handling on the Cortex-M7
