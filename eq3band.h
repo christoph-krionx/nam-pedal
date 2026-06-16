@@ -58,7 +58,12 @@ class Eq3Band
 
     // gain_db is the boost/cut for each band (0 dB == flat).
     void SetBass(float gain_db) { LowShelf(low_, kBassFreq, gain_db); }
-    void SetMid(float gain_db) { Peaking(mid_, kMidFreq, kMidQ, gain_db); }
+    void SetMid(float gain_db)
+    {
+        // Plugin uses a wider bell on boost and a narrower notch on cut.
+        float q = (gain_db >= 0.0f) ? kMidQBoost : kMidQCut;
+        Peaking(mid_, kMidFreq, q, gain_db);
+    }
     void SetTreble(float gain_db) { HighShelf(high_, kTrebleFreq, gain_db); }
 
     inline float Process(float x)
@@ -67,12 +72,14 @@ class Eq3Band
     }
 
   private:
-    // Band corner/center frequencies tuned for guitar tone shaping.
-    static constexpr float kBassFreq   = 200.0f;
-    static constexpr float kMidFreq    = 1000.0f;
-    static constexpr float kMidQ       = 0.7f;
-    static constexpr float kTrebleFreq = 3200.0f;
-    static constexpr float kShelfSlope = 1.0f; // max steepness w/o overshoot
+    // Band parameters matched to the NAM plugin ToneStack (ToneStack.cpp).
+    static constexpr float kBassFreq   = 150.0f;
+    static constexpr float kMidFreq    = 425.0f;
+    static constexpr float kMidQBoost  = 0.7f;
+    static constexpr float kMidQCut    = 1.5f;
+    static constexpr float kTrebleFreq = 1800.0f;
+    // S=1 gives alpha = sw/sqrt(2), identical to the plugin's Q=0.707 shelves.
+    static constexpr float kShelfSlope = 1.0f;
     static constexpr float kPi         = 3.14159265358979323846f;
 
     void Peaking(Biquad& bq, float f0, float q, float db)

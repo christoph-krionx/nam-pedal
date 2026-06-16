@@ -17,17 +17,19 @@ LDFLAGS = -u _printf_float
 
 include $(SYSTEM_FILES_DIR)/Makefile
 
-# The Terrarium has no SD card, so the NAM model is embedded in QSPI flash.
-# model_data.h is regenerated from model.namb whenever the model changes;
-# drop in a different model.namb and rebuild to swap models.
-model_data.h: model.namb gen_model_data.py
-	python3 gen_model_data.py model.namb model_data.h
-
-build/NAMPedal.o: model_data.h
+# Models are stored in a separate QSPI flash region (0x90800000) and loaded at
+# runtime — no rebuild needed to swap models.  Use pack_models.py to build and
+# flash a model bank independently of this firmware.
 
 # Daisy audio block size is 48 frames — must match NAMPedal.cpp SetAudioBlockSize.
 # NAM_DTCM places weights and small ring buffers in fast DTCM (Cortex-M7).
+ifeq ($(LOGGING),1)
+CPPFLAGS += -DLOGGING
+CFLAGS   += -DLOGGING
+endif
+
 CFLAGS   += -ffast-math -fno-unroll-loops -ftree-vectorize \
             -DNAM_MAX_BUFFER_SIZE=48 \
             -DNAM_DTCM='__attribute__((section(".dtcmram_bss")))'
-CPPFLAGS += -DNAM_MAX_BUFFER_SIZE=48
+CPPFLAGS += -DNAM_MAX_BUFFER_SIZE=48 \
+            -DNAM_DTCM='__attribute__((section(".dtcmram_bss")))'

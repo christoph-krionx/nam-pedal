@@ -9,12 +9,12 @@ namespace terrarium
 		public:
 			enum Sw
 			{
-				FOOTSWITCH_1 = 4,
-				FOOTSWITCH_2 = 5,
-				SWITCH_1 = 2,
-				SWITCH_2 = 1,
-				SWITCH_3 = 0,
-				SWITCH_4 = 6
+				FOOTSWITCH_1 = 25,
+				FOOTSWITCH_2 = 26,
+				SWITCH_1 = 10,
+				SWITCH_2 = 9,
+				SWITCH_3 = 8,
+				SWITCH_4 = 7
 			};
 
 			enum Knob
