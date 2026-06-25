@@ -43,6 +43,7 @@ Examples:
 """
 
 import argparse
+import math
 import os
 import struct
 import subprocess
@@ -65,7 +66,7 @@ def _s24_le(data, offset):
     return v - 0x1000000 if v >= 0x800000 else v
 
 
-def read_wav_mono_f32(path, max_samples=None):
+def read_wav_mono_f32(path):
     """Return (samples: list[float], sample_rate: int) from a WAV file.
 
     Supports PCM 16/24/32-bit and IEEE float 32-bit.  Multi-channel files are
@@ -124,15 +125,121 @@ def read_wav_mono_f32(path, max_samples=None):
         sys.exit(f'error: {path}: unsupported format code {audio_fmt} / {bps}-bit')
 
     mono = interleaved[::num_ch]  # channel 0 only
-
-    if max_samples is not None and len(mono) > max_samples:
-        orig_ms = len(mono) / sample_rate * 1000
-        clip_ms = max_samples / sample_rate * 1000
-        print(f'  warning: IR truncated {len(mono)} → {max_samples} taps '
-              f'({orig_ms:.1f} ms → {clip_ms:.1f} ms)')
-        mono = mono[:max_samples]
-
     return mono, sample_rate
+
+
+# ── IR processing pipeline ────────────────────────────────────────────────
+
+def _ir_resample(samples, from_rate, to_rate):
+    if from_rate == to_rate:
+        return samples
+    try:
+        from scipy.signal import resample_poly
+        from math import gcd
+        import numpy as np
+        g = gcd(to_rate, from_rate)
+        return list(resample_poly(np.array(samples, dtype='float64'),
+                                  to_rate // g, from_rate // g))
+    except ImportError:
+        pass
+    try:
+        import numpy as np
+        n_out = round(len(samples) * to_rate / from_rate)
+        return list(np.interp(np.linspace(0, 1, n_out),
+                               np.linspace(0, 1, len(samples)),
+                               samples))
+    except ImportError:
+        pass
+    n_in = len(samples)
+    n_out = round(n_in * to_rate / from_rate)
+    result = []
+    for i in range(n_out):
+        t = i * (n_in - 1) / max(n_out - 1, 1)
+        lo = int(t); hi = min(lo + 1, n_in - 1)
+        result.append(samples[lo] + (t - lo) * (samples[hi] - samples[lo]))
+    return result
+
+
+def _ir_minimum_phase(samples, eps=1e-8):
+    """Minimum-phase conversion via real cepstrum. Requires numpy."""
+    import numpy as np
+    n = len(samples)
+    if n < 4:
+        return samples
+    fft_size = 1
+    while fft_size < n:
+        fft_size <<= 1
+    fft_size <<= 2  # 4× to prevent cepstral aliasing
+
+    h    = np.array(samples, dtype=np.float64)
+    H    = np.fft.rfft(h, n=fft_size)
+    mag  = np.abs(H)
+    peak = float(np.max(mag))
+    if peak < 1e-30:
+        return samples
+
+    log_mag  = np.log(np.maximum(mag, eps * peak))
+    cepstrum = np.fft.irfft(log_mag, n=fft_size)
+
+    fold = np.zeros(fft_size)
+    fold[0]                   = cepstrum[0]
+    fold[1:fft_size // 2]     = 2.0 * cepstrum[1:fft_size // 2]
+    fold[fft_size // 2]       = cepstrum[fft_size // 2]
+
+    h_mp = np.fft.irfft(np.exp(np.fft.rfft(fold, n=fft_size)), n=fft_size)
+    return list(h_mp[:n])
+
+
+def _ir_trim_taper(samples, n_taps, fade_len=64):
+    """Truncate to n_taps with a Hann half-window over the last fade_len samples."""
+    import math as _math
+    out = list(samples[:n_taps]) if len(samples) >= n_taps \
+          else list(samples) + [0.0] * (n_taps - len(samples))
+    fade_len = min(fade_len, n_taps)
+    start = n_taps - fade_len
+    for i in range(fade_len):
+        t = i / max(fade_len - 1, 1)
+        out[start + i] *= 0.5 * (1.0 + _math.cos(_math.pi * t))
+    return out
+
+
+def _ir_normalize(samples):
+    peak = max(abs(s) for s in samples)
+    if peak < 1e-30:
+        return list(samples)
+    return [s / peak for s in samples]
+
+
+def process_ir(samples, sample_rate, target_rate=48000, max_taps=MAX_IR_TAPS):
+    """Full IR pipeline: resample → min-phase → truncate+taper → normalize."""
+    # Resample
+    if sample_rate != target_rate:
+        print(f'       resampling {sample_rate} Hz → {target_rate} Hz...')
+        samples = _ir_resample(samples, sample_rate, target_rate)
+
+    # Minimum-phase conversion
+    try:
+        samples = _ir_minimum_phase(samples)
+        print(f'       min-phase: applied')
+    except ImportError:
+        print(f'       min-phase: skipped (pip install numpy for better truncation)')
+
+    # Truncate + Hann tail taper
+    n_in = len(samples)
+    fade = 64  # 25% of 256; chosen to smooth the truncation without sacrificing body
+    samples = _ir_trim_taper(samples, max_taps, fade_len=fade)
+    if n_in > max_taps:
+        print(f'       truncated {n_in} → {max_taps} taps '
+              f'({n_in / target_rate * 1000:.1f} ms → {max_taps / target_rate * 1000:.1f} ms), '
+              f'Hann tail {fade} samples')
+
+    # Normalize
+    peak = max(abs(s) for s in samples)
+    if peak > 1e-30:
+        samples = _ir_normalize(samples)
+        print(f'       normalized: peak was {20 * math.log10(peak):.1f} dBFS → 0.0 dBFS')
+
+    return samples
 
 
 # ── .nam → .namb conversion via nam2namb ─────────────────────────────────
@@ -281,13 +388,12 @@ def trigger_dfu(port):
 
     print(f'sending DFU trigger to {port}...')
     try:
-        # dsrdtr=False prevents asserting DTR on open, which can cause spurious
-        # CDC control requests that interfere with the receive path.
-        s = serial.Serial(port, timeout=1, dsrdtr=False, rtscts=False)
-        time.sleep(0.1)   # let the CDC connection settle before writing
+        s = serial.Serial(port, baudrate=115200, timeout=1)
+        s.dtr = True      # macOS USB CDC requires DTR asserted to forward data
+        time.sleep(0.2)   # let the CDC connection settle before writing
         s.write(b'D')
         s.flush()         # ensure the USB packet is transmitted before close
-        time.sleep(0.1)   # keep the port open until the packet is on the wire
+        time.sleep(0.5)   # keep the port open until the packet is on the wire
         s.close()
     except Exception as e:
         sys.exit(f'error: could not open {port}: {e}')
@@ -366,13 +472,10 @@ def main():
         ir_bytes = None
         if len(parts) == 3:
             ir_path = os.path.expanduser(parts[2])
-            ir_samples, sr = read_wav_mono_f32(ir_path, max_samples=MAX_IR_TAPS)
+            ir_samples, sr = read_wav_mono_f32(ir_path)
+            print(f'       IR: {ir_path} ({len(ir_samples)} taps @ {sr} Hz)')
+            ir_samples = process_ir(ir_samples, sr)
             ir_bytes = struct.pack(f'<{len(ir_samples)}f', *ir_samples)
-            ms = len(ir_samples) / sr * 1000
-            print(f'       IR: {ir_path} ({len(ir_samples)} taps, {ms:.1f} ms @ {sr} Hz)')
-            if sr != 48000:
-                print(f'  WARNING: IR sample rate is {sr} Hz, firmware runs at 48000 Hz.')
-                print(f'           Resample the IR to 48000 Hz before packing.')
 
         models.append((name, namb, ir_bytes))
 

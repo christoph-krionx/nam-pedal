@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-convert_ir.py — resample and trim a cabinet IR WAV to exactly N taps at 48 kHz.
+convert_ir.py — prepare a cabinet IR WAV for NAMPedal.
+
+Pipeline:
+  1. Resample to --rate if needed (scipy polyphase > numpy > pure-Python)
+  2. Minimum-phase conversion via real cepstrum (requires numpy)
+     Front-loads IR energy so truncation at --taps loses minimal content.
+  3. Truncate to --taps; apply a Hann half-window over the last --fade samples
+     to prevent spectral ripple from the hard cut-off.
+  4. Peak-normalise to 1.0.
 
 Usage:
-  python convert_ir.py INPUT.wav OUTPUT.wav [--taps 256] [--rate 48000] [--fade 128]
+  python convert_ir.py INPUT.wav OUTPUT.wav [options]
 
-  --taps N   Target length in samples (default: 256, matches MAX_IR_TAPS in firmware)
-  --rate HZ  Target sample rate (default: 48000)
-  --fade N   Cosine fade-out applied to the last N samples of the tail
-             to prevent a hard-truncation click (default: 128, 0 = off)
+  --taps N        Target length in samples (default: 256, matches MAX_IR_TAPS)
+  --rate HZ       Target sample rate in Hz (default: 48000)
+  --fade N        Hann tail applied to the last N samples (default: 64, ~25%)
+  --no-min-phase  Skip minimum-phase conversion (not recommended)
+  --no-normalize  Skip peak normalisation
+  --eps FLOAT     Log-magnitude floor for min-phase cepstrum, relative to peak
+                  (default: 1e-8; lower = more accurate, higher = more stable)
 
-Uses scipy.signal.resample_poly when available (highest quality); falls back
-to numpy linear interpolation, then to pure-Python linear interpolation.
-
-The output is a mono IEEE-float-32 WAV at the target rate, ready to pass
-directly to pack_models.py as the IR argument:
+The output is a mono IEEE-float-32 WAV ready for pack_models.py:
 
   python pack_models.py --flash "Amp:model.namb:OUTPUT.wav"
 """
@@ -33,7 +40,6 @@ def read_wav_mono_f32(path):
 
     Supports PCM 16/24/32-bit and IEEE float 32-bit.
     Multi-channel files use channel 0 only.
-    Samples are normalised to [-1, 1].
     """
     try:
         raw = open(path, 'rb').read()
@@ -53,7 +59,7 @@ def read_wav_mono_f32(path):
             fmt_chunk = body
         elif tag == b'data':
             data_chunk = body
-        pos += 8 + clen + (clen & 1)  # word-align per RIFF spec
+        pos += 8 + clen + (clen & 1)
 
     if fmt_chunk is None or data_chunk is None:
         sys.exit(f'error: {path}: missing fmt or data chunk')
@@ -63,7 +69,7 @@ def read_wav_mono_f32(path):
     sample_rate = struct.unpack_from('<I', fmt_chunk, 4)[0]
     bps         = struct.unpack_from('<H', fmt_chunk, 14)[0]
 
-    if audio_fmt == 0xFFFE and len(fmt_chunk) >= 26:   # EXTENSIBLE
+    if audio_fmt == 0xFFFE and len(fmt_chunk) >= 26:
         audio_fmt = struct.unpack_from('<H', fmt_chunk, 24)[0]
 
     frame_bytes = (bps // 8) * num_ch
@@ -76,7 +82,7 @@ def read_wav_mono_f32(path):
     if   audio_fmt == 3 and bps == 32:
         raw_s = list(struct.unpack_from(f'<{n * num_ch}f', data_chunk))
     elif audio_fmt == 1 and bps == 16:
-        raw_s = [s / 32768.0 for s in struct.unpack_from(f'<{n * num_ch}h', data_chunk)]
+        raw_s = [s / 32768.0     for s in struct.unpack_from(f'<{n * num_ch}h', data_chunk)]
     elif audio_fmt == 1 and bps == 24:
         raw_s = [s24(data_chunk, i * 3) / 8388608.0 for i in range(n * num_ch)]
     elif audio_fmt == 1 and bps == 32:
@@ -84,27 +90,18 @@ def read_wav_mono_f32(path):
     else:
         sys.exit(f'error: {path}: unsupported format {audio_fmt}/{bps}-bit')
 
-    return raw_s[::num_ch], sample_rate   # channel 0
+    return raw_s[::num_ch], sample_rate
 
 
 def write_wav_f32_mono(path, samples, sample_rate):
-    """Write a mono IEEE-float-32 WAV."""
     n    = len(samples)
     data = struct.pack(f'<{n}f', *samples)
-    fmt  = struct.pack('<HHIIHH',
-        3,               # IEEE float
-        1,               # mono
-        sample_rate,
-        sample_rate * 4, # byte rate
-        4,               # block align
-        32)              # bits per sample
-
+    fmt  = struct.pack('<HHIIHH', 3, 1, sample_rate, sample_rate * 4, 4, 32)
     out  = b'RIFF'
     out += struct.pack('<I', 4 + (8 + len(fmt)) + (8 + len(data)))
     out += b'WAVE'
     out += b'fmt '  + struct.pack('<I', len(fmt))  + fmt
     out += b'data'  + struct.pack('<I', len(data)) + data
-
     with open(path, 'wb') as f:
         f.write(out)
 
@@ -112,34 +109,30 @@ def write_wav_f32_mono(path, samples, sample_rate):
 # ── Resampling ────────────────────────────────────────────────────────────
 
 def resample_to(samples, from_rate, to_rate):
-    """Resample, preferring scipy > numpy > pure-Python."""
     if from_rate == to_rate:
         return samples
 
-    # Best quality: scipy polyphase
     try:
         from scipy.signal import resample_poly
         from math import gcd
         import numpy as np
-        g     = gcd(to_rate, from_rate)
+        g = gcd(to_rate, from_rate)
         up, down = to_rate // g, from_rate // g
-        print(f'  scipy.signal.resample_poly  up={up}  down={down}')
+        print(f'  scipy polyphase  up={up}  down={down}')
         return list(resample_poly(np.array(samples, dtype='float64'), up, down))
     except ImportError:
         pass
 
-    # Good quality: numpy linear interpolation
     try:
         import numpy as np
-        n_out  = round(len(samples) * to_rate / from_rate)
-        old_t  = np.linspace(0.0, 1.0, len(samples))
-        new_t  = np.linspace(0.0, 1.0, n_out)
+        n_out = round(len(samples) * to_rate / from_rate)
+        old_t = np.linspace(0.0, 1.0, len(samples))
+        new_t = np.linspace(0.0, 1.0, n_out)
         print('  numpy linear interpolation (install scipy for higher quality)')
         return list(np.interp(new_t, old_t, samples))
     except ImportError:
         pass
 
-    # Fallback: pure Python linear interpolation
     n_in  = len(samples)
     n_out = round(n_in * to_rate / from_rate)
     print('  pure-Python linear interpolation (install numpy/scipy for higher quality)')
@@ -152,24 +145,101 @@ def resample_to(samples, from_rate, to_rate):
     return result
 
 
-# ── Trim / pad / fade ─────────────────────────────────────────────────────
+# ── Minimum-phase conversion ──────────────────────────────────────────────
 
-def trim_pad_fade(samples, n_taps, fade_len):
-    """Trim or zero-pad to n_taps, then apply a cosine fade-out to the tail."""
+def minimum_phase(samples, eps=1e-8):
+    """Convert IR to its minimum-phase equivalent via the real-cepstrum method.
+
+    The minimum-phase version has the same magnitude spectrum but concentrates
+    all energy at the start of the impulse response, so truncation at a fixed
+    tap count causes far less spectral coloration than truncating a linear-phase
+    or mixed-phase IR.
+
+    Algorithm:
+      H       = FFT(h, N)                  — N = 4× next power-of-2 above len(h)
+      log_mag = log(max(|H|, eps * peak))  — eps floor prevents log singularity
+      c       = IFFT(log_mag)              — real cepstrum (symmetric)
+      fold    — double c[1..N/2-1], keep c[0] and c[N/2], zero anti-causal half
+      H_mp    = exp(FFT(fold))             — minimum-phase spectrum
+      h_mp    = IFFT(H_mp)[:len(h)]       — time-domain minimum-phase IR
+
+    The 4× FFT oversize prevents cepstral aliasing (the cepstrum of a long IR
+    wraps around if the FFT is too small, corrupting the result).
+    The relative eps floor (not absolute) handles spectral nulls without
+    significantly altering the shape of the magnitude response.
+
+    Requires numpy. Raises ImportError if not available.
+    """
+    import numpy as np
+
+    n = len(samples)
+    if n < 4:
+        return samples  # too short to be meaningful
+
+    # 4× next-power-of-2 to prevent cepstral time-domain aliasing
+    fft_size = 1
+    while fft_size < n:
+        fft_size <<= 1
+    fft_size <<= 2
+
+    h    = np.array(samples, dtype=np.float64)
+    H    = np.fft.rfft(h, n=fft_size)
+    mag  = np.abs(H)
+    peak = float(np.max(mag))
+    if peak < 1e-30:
+        return samples  # silent IR
+
+    # Log-magnitude with floor relative to spectral peak
+    log_mag = np.log(np.maximum(mag, eps * peak))
+
+    # Real cepstrum: IFFT of log-magnitude (treated as Hermitian-symmetric)
+    cepstrum = np.fft.irfft(log_mag, n=fft_size)
+
+    # Minimum-phase liftering: double causal half, zero anti-causal half
+    fold              = np.zeros(fft_size)
+    fold[0]           = cepstrum[0]                          # DC
+    fold[1:fft_size // 2] = 2.0 * cepstrum[1:fft_size // 2] # causal (doubled)
+    fold[fft_size // 2]   = cepstrum[fft_size // 2]         # Nyquist
+
+    # Reconstruct minimum-phase IR
+    H_mp = np.exp(np.fft.rfft(fold, n=fft_size))
+    h_mp = np.fft.irfft(H_mp, n=fft_size)
+    return list(h_mp[:n])
+
+
+# ── Tail taper ────────────────────────────────────────────────────────────
+
+def trim_and_taper(samples, n_taps, fade_len):
+    """Truncate or zero-pad to n_taps, then apply a Hann half-window to the tail.
+
+    The Hann taper (1 → 0 over fade_len samples) prevents the spectral ripple
+    caused by the hard discontinuity at the truncation point.  A fade covering
+    ~25% of the target length is a good default; longer fades trade off more
+    high-frequency content for a smoother magnitude response.
+    """
     if len(samples) >= n_taps:
-        samples = list(samples[:n_taps])
+        out = list(samples[:n_taps])
     else:
-        samples = list(samples) + [0.0] * (n_taps - len(samples))
+        out = list(samples) + [0.0] * (n_taps - len(samples))
 
     if fade_len > 0:
         fade_len = min(fade_len, n_taps)
-        start    = n_taps - fade_len
+        start = n_taps - fade_len
         for i in range(fade_len):
-            t           = i / max(fade_len - 1, 1)
-            w           = 0.5 * (1.0 + math.cos(math.pi * t))  # 1 → 0
-            samples[start + i] *= w
+            t = i / max(fade_len - 1, 1)
+            out[start + i] *= 0.5 * (1.0 + math.cos(math.pi * t))  # 1 → 0
 
-    return samples
+    return out
+
+
+# ── Normalisation ─────────────────────────────────────────────────────────
+
+def normalize(samples):
+    """Scale so the absolute peak equals 1.0.  No-op for a silent signal."""
+    peak = max(abs(s) for s in samples)
+    if peak < 1e-30:
+        return list(samples)
+    return [s / peak for s in samples]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
@@ -184,8 +254,15 @@ def main():
                     help='Target length in taps (default: 256)')
     ap.add_argument('--rate', type=int, default=48000,
                     help='Target sample rate in Hz (default: 48000)')
-    ap.add_argument('--fade', type=int, default=128,
-                    help='Tail fade-out length in samples (default: 128, 0 = off)')
+    ap.add_argument('--fade', type=int, default=64,
+                    help='Hann tail length in samples (default: 64, ~25%% of 256)')
+    ap.add_argument('--no-min-phase', action='store_true',
+                    help='Skip minimum-phase conversion')
+    ap.add_argument('--no-normalize', action='store_true',
+                    help='Skip peak normalisation')
+    ap.add_argument('--eps', type=float, default=1e-8,
+                    help='Log-magnitude floor for cepstrum, relative to peak '
+                         '(default: 1e-8)')
     args = ap.parse_args()
 
     samples, sr = read_wav_mono_f32(args.input)
@@ -193,23 +270,46 @@ def main():
     print(f'input:  {os.path.basename(args.input)}'
           f'  {n_in} taps @ {sr} Hz  ({n_in / sr * 1000:.1f} ms)')
 
+    # 1. Resample
     if sr != args.rate:
         print(f'resampling {sr} Hz → {args.rate} Hz ...')
         samples = resample_to(samples, sr, args.rate)
         print(f'  {len(samples)} taps after resample')
 
-    action = 'trimmed' if len(samples) > args.taps else 'zero-padded'
-    samples = trim_pad_fade(samples, args.taps, args.fade)
-    fade_note = f', cosine fade last {args.fade} samples' if args.fade > 0 else ''
-    print(f'{action} → {args.taps} taps{fade_note}')
+    # 2. Minimum-phase conversion
+    if not args.no_min_phase:
+        try:
+            samples = minimum_phase(samples, eps=args.eps)
+            print(f'min-phase: applied  (eps={args.eps:.0e})')
+        except ImportError:
+            print('min-phase: skipped — numpy not found  (pip install numpy)')
+    else:
+        print('min-phase: skipped (--no-min-phase)')
 
-    peak   = max(abs(s) for s in samples)
-    peak_db = 20 * math.log10(peak) if peak > 0 else float('-inf')
-    print(f'peak:   {peak:.5f}  ({peak_db:.1f} dBFS)')
-    ms = args.taps / args.rate * 1000
+    # 3. Truncate + Hann tail taper
+    n_before = len(samples)
+    action   = 'truncated' if n_before > args.taps else 'zero-padded'
+    samples  = trim_and_taper(samples, args.taps, args.fade)
+    fade_str = f', Hann tail {args.fade} samples' if args.fade > 0 else ''
+    print(f'{action} {n_before} → {args.taps} taps'
+          f'  ({n_before / args.rate * 1000:.1f} ms → {args.taps / args.rate * 1000:.1f} ms)'
+          f'{fade_str}')
+
+    # 4. Normalise
+    if not args.no_normalize:
+        peak = max(abs(s) for s in samples)
+        if peak > 1e-30:
+            samples = [s / peak for s in samples]
+            print(f'normalized: peak was {20 * math.log10(peak):.1f} dBFS → 0.0 dBFS')
+        else:
+            print('normalize: signal is silent, skipped')
+    else:
+        peak = max(abs(s) for s in samples)
+        peak_db = 20 * math.log10(peak) if peak > 1e-30 else float('-inf')
+        print(f'normalize: skipped  (peak {peak:.5f} = {peak_db:.1f} dBFS)')
+
     print(f'output: {os.path.basename(args.output)}'
-          f'  {args.taps} taps @ {args.rate} Hz  ({ms:.1f} ms)')
-
+          f'  {args.taps} taps @ {args.rate} Hz  ({args.taps / args.rate * 1000:.1f} ms)')
     write_wav_f32_mono(args.output, samples, args.rate)
 
 

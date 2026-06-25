@@ -33,3 +33,29 @@ CFLAGS   += -ffast-math -fno-unroll-loops -ftree-vectorize \
             -DNAM_DTCM='__attribute__((section(".dtcmram_bss")))'
 CPPFLAGS += -DNAM_MAX_BUFFER_SIZE=48 \
             -DNAM_DTCM='__attribute__((section(".dtcmram_bss")))'
+
+# Override program-dfu to support automatic DFU trigger via the pedal's USB
+# CDC serial port.  The firmware responds to a 'D' byte by resetting into DFU
+# mode.  Requires pyserial (pip install pyserial).
+#
+# Usage:
+#   make program-dfu PORT=/dev/cu.usbmodemXXXX   # trigger DFU automatically
+#   make program-dfu                               # Daisy already in DFU mode
+#
+# On macOS use /dev/cu.usbmodem* (callout), NOT /dev/tty.usbmodem*.
+# The tty. device blocks on open waiting for carrier detect; cu. does not.
+program-dfu:
+	@echo "program-dfu: PORT=[$(PORT)]"
+ifdef PORT
+	@echo "Sending DFU trigger to $(PORT)..."
+	python3 -c "\
+import serial, time; \
+s = serial.Serial('$(PORT)', baudrate=115200, timeout=1); \
+s.dtr = True; \
+time.sleep(0.2); s.write(b'D'); s.flush(); time.sleep(0.5); s.close(); \
+print('DFU trigger sent to $(PORT), waiting for re-enumeration...')"
+	sleep 4
+else
+	@echo "(no PORT set — device should already be in DFU mode)"
+endif
+	dfu-util -a 0 -s $(FLASH_ADDRESS):leave -D $(BUILD_DIR)/$(TARGET_BIN) -d ,0483:$(USBPID)

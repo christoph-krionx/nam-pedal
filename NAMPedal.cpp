@@ -5,14 +5,14 @@
 // MODEL_BANK_ADDR.  The bank is built and flashed with pack_models.py,
 // independently of the firmware, so models can be swapped without recompiling.
 //
-// Signal chain: input gain -> NAM model -> 3-band EQ -> output volume.
+// Signal chain: input -> noise gate -> input gain -> NAM -> 3-band EQ -> IR -> output volume.
 //
 // Terrarium controls:
-//   KNOB_1 = input gain   KNOB_2 = output volume   KNOB_3 = (unused)
-//   KNOB_4 = bass         KNOB_5 = mid             KNOB_6 = treble
-//   FOOTSWITCH_1 = next model   FOOTSWITCH_2 = previous model
-//   both footswitches together  = bypass toggle
-//   LED_1 = lit when effect active   LED_2 = blinks to confirm model slot
+//   KNOB_1 = input gain (gate off) / noise gate threshold (gate on)
+//   KNOB_2 = output volume   KNOB_3 = mid   KNOB_4 = bass   KNOB_6 = treble
+//   FOOTSWITCH_1 = bypass toggle   FOOTSWITCH_2 = noise gate on/off
+//   both footswitches together = next preset
+//   LED_1 = lit when effect active   LED_2 = lit when noise gate active
 
 #include "daisy_seed.h"
 #include "terrarium.h"
@@ -28,9 +28,12 @@ using namespace daisy;
 using namespace terrarium;
 
 #ifdef LOGGING
-#  define LOG(fmt, ...) hw.PrintLine(fmt, ##__VA_ARGS__)
+#define LOG(fmt, ...) hw.PrintLine(fmt, ##__VA_ARGS__)
 #else
-#  define LOG(fmt, ...) do {} while(0)
+#define LOG(fmt, ...) \
+    do                \
+    {                 \
+    } while(0)
 #endif
 
 // ── Model bank ────────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ static Switch footswitch1, footswitch2;
 static Switch sw1, sw2, sw3, sw4;
 static GPIO   led1, led2;
 
-static Eq3Band eq;
+static NAM_DTCM Eq3Band eq;
 
 // Set by the USB receive callback when a DFU-trigger byte ('D') is received.
 // Checked in the main loop so ResetToBootloader() runs outside the ISR context.
@@ -120,13 +123,14 @@ static void OnUsbReceive(uint8_t* buf, uint32_t* len)
 static volatile float gain          = 1.0f;
 static volatile float volume        = 1.0f;
 static volatile bool  effect_active = true;
+static volatile bool  ng_active     = false;
 
 static nam_state_t   nam_state;
 static volatile bool model_loaded = false;
 
 static constexpr size_t kMaxBlockSize = NAM_MAX_BUFFER_SIZE;
-static float            mono_in[kMaxBlockSize];
-static float            mono_out[kMaxBlockSize];
+static NAM_DTCM float   mono_in[kMaxBlockSize];
+static NAM_DTCM float   mono_out[kMaxBlockSize];
 
 // Time-domain FIR cabinet convolution.
 //
@@ -136,7 +140,80 @@ static float            mono_out[kMaxBlockSize];
 static NAM_DTCM float    g_ir_coeffs[MAX_IR_TAPS];
 static NAM_DTCM float    g_ir_state[2 * MAX_IR_TAPS + NAM_MAX_BUFFER_SIZE - 1];
 static volatile uint32_t g_ir_num_taps = 0;
-static uint32_t          g_ir_head = 0; // write pos, cycles [0, MAX_IR_TAPS)
+static NAM_DTCM uint32_t g_ir_head = 0; // write pos, cycles [0, MAX_IR_TAPS)
+
+// ── Noise gate ────────────────────────────────────────────────────────────
+//
+// Power-domain envelope follower with hold-time state machine, matching the
+// plugin's Trigger/Gain design but without per-sample log10/pow:
+//   - Threshold pre-converted to power in the control loop (KNOB_1 when active).
+//   - Gate gain tracked in linear space; no dB conversion per sample.
+//   - Operates on the raw input (before the gain knob) so the threshold is
+//     gain-independent.
+//   - Signal chain: input → [gate] → × gain → NAM → EQ → IR → output.
+
+struct NoiseGate
+{
+    float    level      = 0.0f; // power envelope
+    float    gain       = 0.0f; // current gate gain [0, 1]
+    uint32_t held       = 0;    // samples spent holding open
+    bool     holding    = false;
+    float    alpha      = 0.0f; // envelope coeff
+    float    beta       = 0.0f; // 1 - alpha
+    float    open_rate  = 0.0f; // gain increase per sample (attack)
+    float    close_rate = 0.0f; // gain decrease per sample (release)
+    uint32_t hold_max   = 0;    // hold duration in samples
+    float    threshold  = 0.0f; // power threshold, written by control loop
+
+    void Init(float sample_rate)
+    {
+        alpha      = expf(-1.0f / (0.005f * sample_rate)); // 5 ms envelope
+        beta       = 1.0f - alpha;
+        open_rate  = 1.0f / (0.002f * sample_rate); // 2 ms attack
+        close_rate = 1.0f / (0.100f * sample_rate); // 100 ms release
+        hold_max   = static_cast<uint32_t>(0.050f * sample_rate); // 50 ms hold
+        threshold  = 1e-6f; // -60 dBFS default
+    }
+
+    inline float Process(float x)
+    {
+        level = alpha * level + beta * (x * x);
+        if(holding)
+        {
+            if(level < threshold)
+            {
+                if(++held >= hold_max)
+                    holding = false;
+            }
+            else
+            {
+                held = 0;
+            }
+        }
+        else
+        {
+            if(level >= threshold)
+            {
+                gain += open_rate;
+                if(gain >= 1.0f)
+                {
+                    gain    = 1.0f;
+                    holding = true;
+                    held    = 0;
+                }
+            }
+            else
+            {
+                gain -= close_rate;
+                if(gain < 0.0f)
+                    gain = 0.0f;
+            }
+        }
+        return x * gain;
+    }
+};
+
+static NAM_DTCM NoiseGate gate;
 
 // A2-nano receptive field. Dilations × (kernel_size − 1) across all layers:
 //   layers  0–13: kernel=6,  dilations [1,3,7,17,41,101,239,×2] → 4090
@@ -205,8 +282,8 @@ static bool LoadModel()
     if(bank->magic != MODEL_BANK_MAGIC)
     {
         LOG("  no model bank at 0x%08lX (magic=0x%08lX)",
-                     (unsigned long)MODEL_BANK_ADDR,
-                     (unsigned long)bank->magic);
+            (unsigned long)MODEL_BANK_ADDR,
+            (unsigned long)bank->magic);
         return false;
     }
     if(bank->num_models == 0)
@@ -231,10 +308,10 @@ static bool LoadModel()
     uint32_t size = e.size;
 
     LOG("  model %lu/%lu: \"%s\" (%lu bytes)",
-                 (unsigned long)(idx + 1),
-                 (unsigned long)bank->num_models,
-                 e.name,
-                 (unsigned long)size);
+        (unsigned long)(idx + 1),
+        (unsigned long)bank->num_models,
+        e.name,
+        (unsigned long)size);
 
     if(size < 32)
     {
@@ -255,8 +332,8 @@ static bool LoadModel()
     memcpy(&num_weights, data + 16, 4);
 
     LOG("  weights: offset=%lu count=%lu",
-                 (unsigned long)weights_offset,
-                 (unsigned long)num_weights);
+        (unsigned long)weights_offset,
+        (unsigned long)num_weights);
 
     if(weights_offset + num_weights * 4u > size)
     {
@@ -287,8 +364,8 @@ static bool LoadModel()
         if(taps > MAX_IR_TAPS)
         {
             LOG("  IR: %lu taps truncated to %lu",
-                         (unsigned long)taps,
-                         (unsigned long)MAX_IR_TAPS);
+                (unsigned long)taps,
+                (unsigned long)MAX_IR_TAPS);
             taps = MAX_IR_TAPS;
         }
 
@@ -303,8 +380,8 @@ static bool LoadModel()
 
         g_ir_num_taps = taps;
         LOG("  IR: %lu taps (%.1f ms)",
-                     (unsigned long)taps,
-                     (float)taps / 48.0f);
+            (unsigned long)taps,
+            (float)taps / 48.0f);
     }
     else
     {
@@ -314,8 +391,7 @@ static bool LoadModel()
     LOG("  prewarming (%d samples)...", kPrewarmSamples);
     uint32_t t0 = System::GetNow();
     Prewarm(kPrewarmSamples);
-    LOG("  model ready (%lu ms)",
-                 (unsigned long)(System::GetNow() - t0));
+    LOG("  model ready (%lu ms)", (unsigned long)(System::GetNow() - t0));
     return true;
 }
 
@@ -327,7 +403,14 @@ static void ToggleBypass()
     led1.Write(effect_active);
 }
 
-// Blink LED2 to confirm the active model slot (1-based count).
+static void ToggleNoisegate()
+{
+    ng_active = !ng_active;
+    led2.Write(ng_active);
+}
+
+// Blink LED2 to confirm the active model slot (1-based count),
+// then restore it to the noise gate indicator state.
 static void BlinkModelSlot(int slot)
 {
     for(int i = 0; i < slot; i++)
@@ -337,6 +420,7 @@ static void BlinkModelSlot(int slot)
         led2.Write(false);
         System::Delay(150);
     }
+    led2.Write(ng_active);
 }
 
 static uint32_t GetBankNumModels()
@@ -353,8 +437,8 @@ static void SwitchToModel(uint32_t idx)
     model_loaded = false; // audio falls through to bypass while we reload
     SaveModelIndex(idx);
     LOG("Switching to model %lu/%lu",
-                 (unsigned long)(idx + 1),
-                 (unsigned long)GetBankNumModels());
+        (unsigned long)(idx + 1),
+        (unsigned long)GetBankNumModels());
     model_loaded = LoadModel();
     LOG("Model load: %s", model_loaded ? "OK" : "FAILED");
     BlinkModelSlot((int)(idx + 1));
@@ -369,14 +453,6 @@ static void NextModel()
     SwitchToModel(idx);
 }
 
-static void PrevModel()
-{
-    uint32_t n = GetBankNumModels();
-    if(n < 2)
-        return;
-    uint32_t idx = (GetSavedModelIndex() + n - 1) % n;
-    SwitchToModel(idx);
-}
 
 // ── IR convolution ────────────────────────────────────────────────────────
 //
@@ -401,17 +477,21 @@ static void IrProcess(const float* __restrict__ src,
     {
         const float* s      = g_ir_state + (head + i + MAX_IR_TAPS - (n - 1));
         const float* coeffs = g_ir_coeffs;
-        float        acc    = 0.0f;
+        // Four independent accumulators hide the M7 FPU's ~5-cycle MAC latency.
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
         uint32_t k = n >> 2;
         while(k--)
         {
-            acc += coeffs[0] * s[0] + coeffs[1] * s[1] + coeffs[2] * s[2]
-                   + coeffs[3] * s[3];
+            acc0 += coeffs[0] * s[0];
+            acc1 += coeffs[1] * s[1];
+            acc2 += coeffs[2] * s[2];
+            acc3 += coeffs[3] * s[3];
             coeffs += 4;
             s += 4;
         }
-        k = n & 3;
+        float acc = (acc0 + acc1) + (acc2 + acc3);
+        k         = n & 3;
         while(k--)
             acc += *coeffs++ * *s++;
 
@@ -433,16 +513,13 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                           AudioHandle::InterleavingOutputBuffer out,
                           size_t                                size)
 {
-    // Force FZ/DN in this ISR context.
-    __set_FPSCR(__get_FPSCR() | (1U << 24) | (1U << 25));
-
     cb_count++;
     size_t num_frames = size / 2;
 
     if(model_loaded && effect_active)
     {
         for(size_t i = 0; i < num_frames; i++)
-            mono_in[i] = in[i * 2] * gain;
+            mono_in[i] = gate.Process(in[i * 2]) * gain;
 
         float* input_ptr  = mono_in;
         float* output_ptr = mono_out;
@@ -518,6 +595,7 @@ int main(void)
 
     hw.SetAudioBlockSize(kMaxBlockSize);
     eq.Init(hw.AudioSampleRate());
+    gate.Init(hw.AudioSampleRate());
 
     AdcChannelConfig adc_cfg[6];
     for(size_t i = 0; i < 6; i++)
@@ -549,8 +627,7 @@ int main(void)
     led1.Init(seed::D22, GPIO::Mode::OUTPUT);
     led2.Init(seed::D23, GPIO::Mode::OUTPUT);
 
-    LOG("Loading model from bank at 0x%08lX",
-                 (unsigned long)MODEL_BANK_ADDR);
+    LOG("Loading model from bank at 0x%08lX", (unsigned long)MODEL_BANK_ADDR);
     model_loaded = LoadModel();
     LOG("Model load: %s", model_loaded ? "OK" : "FAILED");
 
@@ -615,35 +692,35 @@ int main(void)
         uint32_t tot_avg = nam_avg + eq_avg + ir_avg;
 
         LOG("Benchmark (%d blocks x %u frames, budget=%lu cy):",
-                     kRuns,
-                     (unsigned)kMaxBlockSize,
-                     (unsigned long)kBudget);
+            kRuns,
+            (unsigned)kMaxBlockSize,
+            (unsigned long)kBudget);
         LOG("           avg cy   max cy   avg%%   max%%");
         LOG("  NAM  : %7lu  %7lu  %4.1f%%  %4.1f%%",
-                     (unsigned long)nam_avg,
-                     (unsigned long)nam_max,
-                     100.0f * (float)nam_avg / kBudget,
-                     100.0f * (float)nam_max / kBudget);
+            (unsigned long)nam_avg,
+            (unsigned long)nam_max,
+            100.0f * (float)nam_avg / kBudget,
+            100.0f * (float)nam_max / kBudget);
         LOG("  EQ   : %7lu  %7lu  %4.1f%%  %4.1f%%",
-                     (unsigned long)eq_avg,
-                     (unsigned long)eq_max,
-                     100.0f * (float)eq_avg / kBudget,
-                     100.0f * (float)eq_max / kBudget);
+            (unsigned long)eq_avg,
+            (unsigned long)eq_max,
+            100.0f * (float)eq_avg / kBudget,
+            100.0f * (float)eq_max / kBudget);
         if(g_ir_num_taps > 0)
             LOG("  IR   : %7lu  %7lu  %4.1f%%  %4.1f%%  (%lu taps)",
-                         (unsigned long)ir_avg,
-                         (unsigned long)ir_max,
-                         100.0f * (float)ir_avg / kBudget,
-                         100.0f * (float)ir_max / kBudget,
-                         (unsigned long)g_ir_num_taps);
+                (unsigned long)ir_avg,
+                (unsigned long)ir_max,
+                100.0f * (float)ir_avg / kBudget,
+                100.0f * (float)ir_max / kBudget,
+                (unsigned long)g_ir_num_taps);
         else
             LOG("  IR   :      --       --     --     --  (none)");
         LOG("  TOTAL: %7lu  %7lu  %4.1f%%  %4.1f%%  (%.3f ms avg)",
-                     (unsigned long)tot_avg,
-                     (unsigned long)tot_max,
-                     100.0f * (float)tot_avg / kBudget,
-                     100.0f * (float)tot_max / kBudget,
-                     (float)tot_avg / 480000.0f);
+            (unsigned long)tot_avg,
+            (unsigned long)tot_max,
+            100.0f * (float)tot_avg / kBudget,
+            100.0f * (float)tot_max / kBudget,
+            (float)tot_avg / 480000.0f);
     }
 
     hw.adc.Start();
@@ -653,14 +730,15 @@ int main(void)
     led1.Write(true); // start active
     led2.Write(false);
 
-    float    last_bass = 999.0f, last_mid = 999.0f, last_treble = 999.0f;
+    float last_bass = 999.0f, last_mid = 999.0f, last_treble = 999.0f;
+    float last_ng = -1.0f; // tracks KNOB_1 position while noise gate is on
 #ifdef LOGGING
     uint32_t last_print = System::GetNow();
 #endif
 
-    // Chord detection: pressing both switches together toggles bypass.
-    // both_active prevents repeated triggers while both are held.
-    bool both_active = false;
+    // chord_active: set when both footswitches are pressed together.
+    // Individual actions fire on release so a chord can interrupt them cleanly.
+    bool chord_active = false;
 
     for(;;)
     {
@@ -675,7 +753,8 @@ int main(void)
                 led2.Write(false);
                 System::Delay(150);
             }
-            System::ResetToBootloader(System::BootloaderMode::DAISY_SKIP_TIMEOUT);
+            System::ResetToBootloader(
+                System::BootloaderMode::DAISY_INFINITE_TIMEOUT);
         }
 
         footswitch1.Debounce();
@@ -685,8 +764,28 @@ int main(void)
         sw3.Debounce();
         sw4.Debounce();
 
-        gain   = hw.adc.GetFloat(Terrarium::KNOB_1) * 2.0f;
         volume = hw.adc.GetFloat(Terrarium::KNOB_2);
+
+        // KNOB_1 is dual-function: input gain when noise gate is off,
+        // noise gate threshold (CCW = -80 dBFS, CW = -30 dBFS) when on.
+        // When gate is off the threshold is held at 0 (gate always open).
+        // last_ng is reset to -1 each off-cycle so the first on-cycle
+        // immediately picks up the current knob position via powf.
+        float k1 = hw.adc.GetFloat(Terrarium::KNOB_1);
+        if(ng_active)
+        {
+            if(k1 != last_ng)
+            {
+                gate.threshold = powf(10.0f, (-80.0f + k1 * 50.0f) / 10.0f);
+                last_ng        = k1;
+            }
+        }
+        else
+        {
+            gain           = k1 * 2.0f;
+            gate.threshold = 0.0f;
+            last_ng        = -1.0f;
+        }
 
         // Ranges match the NAM plugin ToneStack: bass ±20 dB, mid ±15 dB, treble ±10 dB.
         float bass   = (hw.adc.GetFloat(Terrarium::KNOB_4) - 0.5f) * 40.0f;
@@ -708,56 +807,56 @@ int main(void)
             last_treble = treble;
         }
 
-        if(footswitch1.RisingEdge())
+        // Chord fires immediately on the second press.
+        if(footswitch1.RisingEdge() && footswitch2.Pressed() && !chord_active)
         {
-            if(footswitch2.Pressed())
-            {
-                if(!both_active)
-                {
-                    both_active = true;
-                    ToggleBypass();
-                }
-            }
-            else
-                NextModel();
+            chord_active = true;
+            NextModel();
+        }
+        if(footswitch2.RisingEdge() && footswitch1.Pressed() && !chord_active)
+        {
+            chord_active = true;
+            NextModel();
         }
 
-        if(footswitch2.RisingEdge())
+        // Individual actions fire on release so a chord press can't
+        // accidentally trigger them first.
+        if(footswitch1.FallingEdge())
         {
-            if(footswitch1.Pressed())
-            {
-                if(!both_active)
-                {
-                    both_active = true;
-                    ToggleBypass();
-                }
-            }
-            else
-                PrevModel();
+            if(!chord_active)
+                ToggleBypass();
+            if(!footswitch2.Pressed())
+                chord_active = false;
         }
-
-        if(footswitch1.FallingEdge() && !footswitch2.Pressed())
-            both_active = false;
-        if(footswitch2.FallingEdge() && !footswitch1.Pressed())
-            both_active = false;
+        if(footswitch2.FallingEdge())
+        {
+            if(!chord_active)
+                ToggleNoisegate();
+            if(!footswitch1.Pressed())
+                chord_active = false;
+        }
 
 #ifdef LOGGING
         uint32_t now = System::GetNow();
         if(now - last_print >= 1000)
         {
-            float k1 = hw.adc.GetFloat(Terrarium::KNOB_1);
+            // k1 already read above; re-read others for the log snapshot
             float k2 = hw.adc.GetFloat(Terrarium::KNOB_2);
             float k3 = hw.adc.GetFloat(Terrarium::KNOB_3);
             float k4 = hw.adc.GetFloat(Terrarium::KNOB_4);
-            float k5 = hw.adc.GetFloat(Terrarium::KNOB_5);
             float k6 = hw.adc.GetFloat(Terrarium::KNOB_6);
-            LOG("cb=%lu  cycles=%lu  max=%lu  %s",
+            LOG("cb=%lu  cycles=%lu  max=%lu  %s  ng=%s",
                 (unsigned long)cb_count,
                 (unsigned long)cb_process_cycles,
                 (unsigned long)cb_max_cycles,
-                effect_active ? "ACTIVE" : "BYPASS");
-            LOG("  knobs k1=%.3f k2=%.3f k3=%.3f k4=%.3f k5=%.3f k6=%.3f",
-                k1, k2, k3, k4, k5, k6);
+                effect_active ? "ACTIVE" : "BYPASS",
+                ng_active ? "ON" : "off");
+            LOG("  knobs k1=%.3f k2=%.3f k3=%.3f k4=%.3f k6=%.3f",
+                k1,
+                k2,
+                k3,
+                k4,
+                k6);
             LOG("  ftsw1=%d ftsw2=%d  sw1=%d sw2=%d sw3=%d sw4=%d",
                 footswitch1.Pressed() ? 1 : 0,
                 footswitch2.Pressed() ? 1 : 0,
@@ -766,7 +865,11 @@ int main(void)
                 sw3.Pressed() ? 1 : 0,
                 sw4.Pressed() ? 1 : 0);
             LOG("  gain=%.2f vol=%.2f eq[%.1f %.1f %.1f]",
-                gain, volume, bass, mid, treble);
+                gain,
+                volume,
+                bass,
+                mid,
+                treble);
             last_print = now;
         }
 #endif
