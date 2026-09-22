@@ -1,4 +1,4 @@
-// NAMPedal — Neural Amp Modeler running on a PedalPCB Terrarium (Daisy Seed,
+// NAMPedal — Neural Amp Modeler running on a T3K Pedal (Daisy Seed,
 // pure C inference)
 //
 // Reads A2-nano NAM models (.namb format) from a model bank in QSPI flash at
@@ -7,15 +7,17 @@
 //
 // Signal chain: input -> noise gate -> input gain -> NAM -> 3-band EQ -> IR -> output volume.
 //
-// Terrarium controls:
-//   KNOB_1 = input gain (gate off) / noise gate threshold (gate on)
-//   KNOB_2 = output volume   KNOB_3 = mid   KNOB_4 = bass   KNOB_6 = treble
-//   FOOTSWITCH_1 = bypass toggle   FOOTSWITCH_2 = noise gate on/off
-//   both footswitches together = next preset
-//   LED_1 = lit when effect active   LED_2 = lit when noise gate active
+// T3K Pedal controls:
+//   INPUT_GAIN, OUTPUT_VOLUME, BASS, MID, TREBLE, NOISE_GATE_THRESHOLD knobs
+//   FOOTSWITCH = bypass toggle
+//   Noise gate is always active; its threshold is set entirely by the
+//   NOISE_GATE_THRESHOLD knob (fully CCW = off).
+//   ROTARY_1..4 = preset select (rotary switch, one position grounded at a time)
+//   LED_STATUS = lit when active, off when bypassed, blinks while clipping
+//   LED_PRESET_1..4 = lit for the currently selected preset
 
 #include "daisy_seed.h"
-#include "terrarium.h"
+#include "t3k_pedal.h"
 #include "eq3band.h"
 #include <cstring>
 
@@ -25,7 +27,7 @@ extern "C"
 }
 
 using namespace daisy;
-using namespace terrarium;
+using namespace t3k_pedal;
 
 #ifdef LOGGING
 #define LOG(fmt, ...) hw.PrintLine(fmt, ##__VA_ARGS__)
@@ -84,23 +86,35 @@ struct ModelEntry
 };
 static_assert(sizeof(ModelEntry) == 48, "ModelEntry must be 48 bytes");
 
-// ── Backup SRAM ───────────────────────────────────────────────────────────
-//
-// Selected model index persists across resets in 4 KB backup SRAM at
-// 0x38800000.  Sentinel word guards against uninitialized reads.
-
-static constexpr uint32_t BKPSRAM_BASE  = 0x38800000UL;
-static constexpr uint32_t BKPSRAM_MAGIC = 0xA55AA55AUL;
-
 // ── Hardware objects ──────────────────────────────────────────────────────
 
 static DaisySeed hw;
 
+// DaisySeed::GetPin() returns the legacy dsy_gpio_pin type (Pin converts
+// implicitly to it, but not back); GPIO::Init() needs a daisy::Pin. GPIOPort
+// and dsy_gpio_port share the same enumerator order, so this cast is safe.
+static constexpr Pin ToPin(dsy_gpio_pin p)
+{
+    return Pin(static_cast<GPIOPort>(p.port), p.pin);
+}
+
+// Order must match T3kPedal::Knob (INPUT_GAIN, OUTPUT_VOLUME, BASS, MID,
+// TREBLE, NOISE_GATE_THRESHOLD) — each entry must be an ADC-capable Seed
+// pin (seed::A0..A11).
 static constexpr Pin kKnobPins[6]
-    = {seed::D16, seed::D17, seed::D18, seed::D19, seed::D20, seed::D21};
-static Switch footswitch1, footswitch2;
-static Switch sw1, sw2, sw3, sw4;
-static GPIO   led1, led2;
+    = {seed::A1, seed::A2, seed::A3, seed::A4, seed::A5, seed::A6};
+static Switch footswitch;
+static Switch rotary1, rotary2, rotary3, rotary4;
+static GPIO   led_status;
+static GPIO   led_preset[4];
+
+// Currently loaded preset (0-3), driven by the rotary switch position.
+static volatile int current_preset = 0;
+
+// Set from the audio callback when |sample| crosses the clip threshold;
+// consumed by the main loop to drive the status LED's clip blink.
+static constexpr float kClipThreshold = 0.98f;
+static volatile bool   clip_detected  = false;
 
 static NAM_DTCM Eq3Band eq;
 
@@ -123,7 +137,6 @@ static void OnUsbReceive(uint8_t* buf, uint32_t* len)
 static volatile float gain          = 1.0f;
 static volatile float volume        = 1.0f;
 static volatile bool  effect_active = true;
-static volatile bool  ng_active     = false;
 
 static nam_state_t   nam_state;
 static volatile bool model_loaded = false;
@@ -146,7 +159,8 @@ static NAM_DTCM uint32_t g_ir_head = 0; // write pos, cycles [0, MAX_IR_TAPS)
 //
 // Power-domain envelope follower with hold-time state machine, matching the
 // plugin's Trigger/Gain design but without per-sample log10/pow:
-//   - Threshold pre-converted to power in the control loop (KNOB_1 when active).
+//   - Threshold pre-converted to power in the control loop from the
+//     NOISE_GATE_THRESHOLD knob; fully CCW sets threshold to 0 (off).
 //   - Gate gain tracked in linear space; no dB conversion per sample.
 //   - Operates on the raw input (before the gain knob) so the threshold is
 //     gain-independent.
@@ -223,29 +237,6 @@ static constexpr int kPrewarmSamples = 1 + 4090 + 196 + 2045;
 
 static constexpr uint32_t NAMB_MAGIC = 0x4E414D42; // "NAMB"
 
-// ── Backup SRAM helpers ───────────────────────────────────────────────────
-
-static void EnableBackupSRAM()
-{
-    HAL_PWR_EnableBkUpAccess();
-    __HAL_RCC_BKPRAM_CLK_ENABLE();
-}
-
-static uint32_t GetSavedModelIndex()
-{
-    volatile uint32_t* bkp = reinterpret_cast<volatile uint32_t*>(BKPSRAM_BASE);
-    if(bkp[0] != BKPSRAM_MAGIC)
-        return 0;
-    return bkp[1];
-}
-
-static void SaveModelIndex(uint32_t idx)
-{
-    volatile uint32_t* bkp = reinterpret_cast<volatile uint32_t*>(BKPSRAM_BASE);
-    bkp[0]                 = BKPSRAM_MAGIC;
-    bkp[1]                 = idx;
-}
-
 // ── Model loading ─────────────────────────────────────────────────────────
 
 static void Prewarm(int prewarm_samples)
@@ -272,9 +263,9 @@ static void Prewarm(int prewarm_samples)
     }
 }
 
-// Load the model at the saved index from the QSPI model bank.
+// Load the model at the given preset index from the QSPI model bank.
 // Returns true on success; on failure the audio callback stays in bypass.
-static bool LoadModel()
+static bool LoadModel(uint32_t idx)
 {
     const ModelBankHeader* bank
         = reinterpret_cast<const ModelBankHeader*>(MODEL_BANK_ADDR);
@@ -292,7 +283,6 @@ static bool LoadModel()
         return false;
     }
 
-    uint32_t idx = GetSavedModelIndex();
     if(idx >= bank->num_models)
         idx = 0;
 
@@ -400,27 +390,12 @@ static bool LoadModel()
 static void ToggleBypass()
 {
     effect_active = !effect_active;
-    led1.Write(effect_active);
 }
 
-static void ToggleNoisegate()
+static void UpdatePresetLeds(int preset)
 {
-    ng_active = !ng_active;
-    led2.Write(ng_active);
-}
-
-// Blink LED2 to confirm the active model slot (1-based count),
-// then restore it to the noise gate indicator state.
-static void BlinkModelSlot(int slot)
-{
-    for(int i = 0; i < slot; i++)
-    {
-        led2.Write(true);
-        System::Delay(150);
-        led2.Write(false);
-        System::Delay(150);
-    }
-    led2.Write(ng_active);
+    for(int i = 0; i < 4; i++)
+        led_preset[i].Write(i == preset);
 }
 
 static uint32_t GetBankNumModels()
@@ -432,25 +407,35 @@ static uint32_t GetBankNumModels()
     return bank->num_models;
 }
 
-static void SwitchToModel(uint32_t idx)
+static void SwitchToModel(int idx)
 {
     model_loaded = false; // audio falls through to bypass while we reload
-    SaveModelIndex(idx);
-    LOG("Switching to model %lu/%lu",
-        (unsigned long)(idx + 1),
-        (unsigned long)GetBankNumModels());
-    model_loaded = LoadModel();
+    LOG("Switching to preset %d", idx + 1);
+    model_loaded = LoadModel((uint32_t)idx);
     LOG("Model load: %s", model_loaded ? "OK" : "FAILED");
-    BlinkModelSlot((int)(idx + 1));
+    current_preset = idx;
+    UpdatePresetLeds(current_preset);
 }
 
-static void NextModel()
+// Reads the 4 rotary switch position pins. Exactly one should read
+// "pressed" (grounded) at a time; returns -1 if none or more than one
+// read pressed (mid-rotation, or a wiring fault) so callers can ignore
+// the ambiguous reading and keep the last known preset.
+static int ReadRotaryPreset()
 {
-    uint32_t n = GetBankNumModels();
-    if(n < 2)
-        return;
-    uint32_t idx = (GetSavedModelIndex() + 1) % n;
-    SwitchToModel(idx);
+    bool pressed[4]
+        = {rotary1.Pressed(), rotary2.Pressed(), rotary3.Pressed(), rotary4.Pressed()};
+    int selected = -1;
+    int count    = 0;
+    for(int i = 0; i < 4; i++)
+    {
+        if(pressed[i])
+        {
+            selected = i;
+            count++;
+        }
+    }
+    return (count == 1) ? selected : -1;
 }
 
 
@@ -519,7 +504,12 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     if(model_loaded && effect_active)
     {
         for(size_t i = 0; i < num_frames; i++)
-            mono_in[i] = gate.Process(in[i * 2]) * gain;
+        {
+            float x = in[i * 2];
+            if(fabsf(x) >= kClipThreshold)
+                clip_detected = true;
+            mono_in[i] = gate.Process(x) * gain;
+        }
 
         float* input_ptr  = mono_in;
         float* output_ptr = mono_out;
@@ -554,7 +544,9 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 
         for(size_t i = 0; i < num_frames; i++)
         {
-            float s        = ir_out[i] * volume;
+            float s = ir_out[i] * volume;
+            if(fabsf(s) >= kClipThreshold)
+                clip_detected = true;
             out[i * 2]     = s;
             out[i * 2 + 1] = s;
         }
@@ -563,7 +555,12 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     {
         for(size_t i = 0; i < num_frames; i++)
         {
-            float s        = in[i * 2] * volume;
+            float x = in[i * 2];
+            if(fabsf(x) >= kClipThreshold)
+                clip_detected = true;
+            float s = x * volume;
+            if(fabsf(s) >= kClipThreshold)
+                clip_detected = true;
             out[i * 2]     = s;
             out[i * 2 + 1] = s;
         }
@@ -575,7 +572,6 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 int main(void)
 {
     hw.Init();
-    EnableBackupSRAM();
 
     // FPDSCR sets the default FPSCR for all new FPU contexts (including ISRs).
     uint32_t fpscr = __get_FPSCR();
@@ -602,34 +598,52 @@ int main(void)
         adc_cfg[i].InitSingle(kKnobPins[i]);
     hw.adc.Init(adc_cfg, 6);
 
-    footswitch1.Init(hw.GetPin(Terrarium::FOOTSWITCH_1));
-    footswitch2.Init(hw.GetPin(Terrarium::FOOTSWITCH_2));
-    sw1.Init(hw.GetPin(Terrarium::SWITCH_1),
-             0.f,
-             Switch::TYPE_TOGGLE,
-             Switch::POLARITY_INVERTED,
-             Switch::PULL_UP);
-    sw2.Init(hw.GetPin(Terrarium::SWITCH_2),
-             0.f,
-             Switch::TYPE_TOGGLE,
-             Switch::POLARITY_INVERTED,
-             Switch::PULL_UP);
-    sw3.Init(hw.GetPin(Terrarium::SWITCH_3),
-             0.f,
-             Switch::TYPE_TOGGLE,
-             Switch::POLARITY_INVERTED,
-             Switch::PULL_UP);
-    sw4.Init(hw.GetPin(Terrarium::SWITCH_4),
-             0.f,
-             Switch::TYPE_TOGGLE,
-             Switch::POLARITY_INVERTED,
-             Switch::PULL_UP);
-    led1.Init(seed::D22, GPIO::Mode::OUTPUT);
-    led2.Init(seed::D23, GPIO::Mode::OUTPUT);
+    footswitch.Init(hw.GetPin(T3kPedal::FOOTSWITCH));
+    rotary1.Init(hw.GetPin(T3kPedal::ROTARY_1),
+                 0.f,
+                 Switch::TYPE_TOGGLE,
+                 Switch::POLARITY_INVERTED,
+                 Switch::PULL_UP);
+    rotary2.Init(hw.GetPin(T3kPedal::ROTARY_2),
+                 0.f,
+                 Switch::TYPE_TOGGLE,
+                 Switch::POLARITY_INVERTED,
+                 Switch::PULL_UP);
+    rotary3.Init(hw.GetPin(T3kPedal::ROTARY_3),
+                 0.f,
+                 Switch::TYPE_TOGGLE,
+                 Switch::POLARITY_INVERTED,
+                 Switch::PULL_UP);
+    rotary4.Init(hw.GetPin(T3kPedal::ROTARY_4),
+                 0.f,
+                 Switch::TYPE_TOGGLE,
+                 Switch::POLARITY_INVERTED,
+                 Switch::PULL_UP);
+    led_status.Init(ToPin(hw.GetPin(T3kPedal::LED_STATUS)), GPIO::Mode::OUTPUT);
+    led_preset[0].Init(ToPin(hw.GetPin(T3kPedal::LED_PRESET_1)), GPIO::Mode::OUTPUT);
+    led_preset[1].Init(ToPin(hw.GetPin(T3kPedal::LED_PRESET_2)), GPIO::Mode::OUTPUT);
+    led_preset[2].Init(ToPin(hw.GetPin(T3kPedal::LED_PRESET_3)), GPIO::Mode::OUTPUT);
+    led_preset[3].Init(ToPin(hw.GetPin(T3kPedal::LED_PRESET_4)), GPIO::Mode::OUTPUT);
+
+    // Debounce the rotary switch for a few cycles so its initial reading
+    // (used to pick the boot preset) isn't taken from uninitialized state.
+    for(int i = 0; i < 10; i++)
+    {
+        rotary1.Debounce();
+        rotary2.Debounce();
+        rotary3.Debounce();
+        rotary4.Debounce();
+        System::Delay(1);
+    }
+    int boot_preset = ReadRotaryPreset();
+    if(boot_preset < 0)
+        boot_preset = 0;
+    current_preset = boot_preset;
 
     LOG("Loading model from bank at 0x%08lX", (unsigned long)MODEL_BANK_ADDR);
-    model_loaded = LoadModel();
+    model_loaded = LoadModel((uint32_t)current_preset);
     LOG("Model load: %s", model_loaded ? "OK" : "FAILED");
+    UpdatePresetLeds(current_preset);
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
@@ -727,18 +741,20 @@ int main(void)
     hw.StartAudio(AudioCallback);
     LOG("Audio engine started");
 
-    led1.Write(true); // start active
-    led2.Write(false);
+    led_status.Write(true); // start active
 
     float last_bass = 999.0f, last_mid = 999.0f, last_treble = 999.0f;
-    float last_ng = -1.0f; // tracks KNOB_1 position while noise gate is on
+    float last_ng = -1.0f; // tracks NOISE_GATE_THRESHOLD knob while gate is on
 #ifdef LOGGING
     uint32_t last_print = System::GetNow();
 #endif
 
-    // chord_active: set when both footswitches are pressed together.
-    // Individual actions fire on release so a chord can interrupt them cleanly.
-    bool chord_active = false;
+    // Status LED clip-blink state.
+    static constexpr uint32_t kClipHoldMs       = 300;
+    static constexpr uint32_t kClipBlinkHalfMs  = 100;
+    uint32_t clip_hold_until = 0;
+    uint32_t next_blink_toggle = 0;
+    bool     status_blink_on = false;
 
     for(;;)
     {
@@ -746,51 +762,48 @@ int main(void)
         {
             for(int i = 0; i < 2; i++)
             {
-                led1.Write(true);
-                led2.Write(true);
+                led_status.Write(true);
+                for(int p = 0; p < 4; p++)
+                    led_preset[p].Write(true);
                 System::Delay(150);
-                led1.Write(false);
-                led2.Write(false);
+                led_status.Write(false);
+                for(int p = 0; p < 4; p++)
+                    led_preset[p].Write(false);
                 System::Delay(150);
             }
             System::ResetToBootloader(
                 System::BootloaderMode::DAISY_INFINITE_TIMEOUT);
         }
 
-        footswitch1.Debounce();
-        footswitch2.Debounce();
-        sw1.Debounce();
-        sw2.Debounce();
-        sw3.Debounce();
-        sw4.Debounce();
+        footswitch.Debounce();
+        rotary1.Debounce();
+        rotary2.Debounce();
+        rotary3.Debounce();
+        rotary4.Debounce();
 
-        volume = hw.adc.GetFloat(Terrarium::KNOB_2);
+        volume = hw.adc.GetFloat(T3kPedal::OUTPUT_VOLUME);
 
-        // KNOB_1 is dual-function: input gain when noise gate is off,
-        // noise gate threshold (CCW = -80 dBFS, CW = -30 dBFS) when on.
-        // When gate is off the threshold is held at 0 (gate always open).
-        // last_ng is reset to -1 each off-cycle so the first on-cycle
-        // immediately picks up the current knob position via powf.
-        float k1 = hw.adc.GetFloat(Terrarium::KNOB_1);
-        if(ng_active)
+        float knob_gain = hw.adc.GetFloat(T3kPedal::INPUT_GAIN);
+        gain             = knob_gain * 2.0f;
+
+        // Noise gate threshold tracks the knob directly (CCW = -80 dBFS,
+        // CW = -30 dBFS), with the bottom of the knob's travel shutting
+        // the gate off entirely (threshold 0 = level always above it).
+        static constexpr float kGateOffZone = 0.02f;
+        float knob_gate_threshold = hw.adc.GetFloat(T3kPedal::NOISE_GATE_THRESHOLD);
+        if(knob_gate_threshold != last_ng)
         {
-            if(k1 != last_ng)
-            {
-                gate.threshold = powf(10.0f, (-80.0f + k1 * 50.0f) / 10.0f);
-                last_ng        = k1;
-            }
-        }
-        else
-        {
-            gain           = k1 * 2.0f;
-            gate.threshold = 0.0f;
-            last_ng        = -1.0f;
+            gate.threshold = (knob_gate_threshold <= kGateOffZone)
+                                  ? 0.0f
+                                  : powf(10.0f,
+                                         (-80.0f + knob_gate_threshold * 50.0f) / 10.0f);
+            last_ng = knob_gate_threshold;
         }
 
         // Ranges match the NAM plugin ToneStack: bass ±20 dB, mid ±15 dB, treble ±10 dB.
-        float bass   = (hw.adc.GetFloat(Terrarium::KNOB_4) - 0.5f) * 40.0f;
-        float mid    = (hw.adc.GetFloat(Terrarium::KNOB_3) - 0.5f) * 30.0f;
-        float treble = (hw.adc.GetFloat(Terrarium::KNOB_6) - 0.5f) * 20.0f;
+        float bass   = (hw.adc.GetFloat(T3kPedal::BASS) - 0.5f) * 40.0f;
+        float mid    = (hw.adc.GetFloat(T3kPedal::MID) - 0.5f) * 30.0f;
+        float treble = (hw.adc.GetFloat(T3kPedal::TREBLE) - 0.5f) * 20.0f;
         if(bass != last_bass)
         {
             eq.SetBass(bass);
@@ -807,63 +820,67 @@ int main(void)
             last_treble = treble;
         }
 
-        // Chord fires immediately on the second press.
-        if(footswitch1.RisingEdge() && footswitch2.Pressed() && !chord_active)
-        {
-            chord_active = true;
-            NextModel();
-        }
-        if(footswitch2.RisingEdge() && footswitch1.Pressed() && !chord_active)
-        {
-            chord_active = true;
-            NextModel();
-        }
+        if(footswitch.FallingEdge())
+            ToggleBypass();
 
-        // Individual actions fire on release so a chord press can't
-        // accidentally trigger them first.
-        if(footswitch1.FallingEdge())
+        // Rotary preset select: switch only on an unambiguous single-position
+        // reading that differs from the current preset, and only if that
+        // position actually has a model in the bank.
+        int rotary_preset = ReadRotaryPreset();
+        if(rotary_preset >= 0 && rotary_preset != current_preset
+           && (uint32_t)rotary_preset < GetBankNumModels())
+            SwitchToModel(rotary_preset);
+
+        uint32_t now = System::GetNow();
+
+        // Status LED: blink while clipping, otherwise reflect bypass state.
+        if(clip_detected)
         {
-            if(!chord_active)
-                ToggleBypass();
-            if(!footswitch2.Pressed())
-                chord_active = false;
+            clip_detected    = false;
+            clip_hold_until  = now + kClipHoldMs;
         }
-        if(footswitch2.FallingEdge())
+        if((int32_t)(clip_hold_until - now) > 0)
         {
-            if(!chord_active)
-                ToggleNoisegate();
-            if(!footswitch1.Pressed())
-                chord_active = false;
+            if(now - next_blink_toggle >= kClipBlinkHalfMs)
+            {
+                status_blink_on   = !status_blink_on;
+                next_blink_toggle = now;
+                led_status.Write(status_blink_on);
+            }
+        }
+        else
+        {
+            led_status.Write(effect_active);
         }
 
 #ifdef LOGGING
-        uint32_t now = System::GetNow();
         if(now - last_print >= 1000)
         {
-            // k1 already read above; re-read others for the log snapshot
-            float k2 = hw.adc.GetFloat(Terrarium::KNOB_2);
-            float k3 = hw.adc.GetFloat(Terrarium::KNOB_3);
-            float k4 = hw.adc.GetFloat(Terrarium::KNOB_4);
-            float k6 = hw.adc.GetFloat(Terrarium::KNOB_6);
-            LOG("cb=%lu  cycles=%lu  max=%lu  %s  ng=%s",
+            // knob_gain/knob_gate_threshold already read above; re-read
+            // the others for the log snapshot
+            float knob_volume = hw.adc.GetFloat(T3kPedal::OUTPUT_VOLUME);
+            float knob_bass   = hw.adc.GetFloat(T3kPedal::BASS);
+            float knob_mid    = hw.adc.GetFloat(T3kPedal::MID);
+            float knob_treble = hw.adc.GetFloat(T3kPedal::TREBLE);
+            LOG("cb=%lu  cycles=%lu  max=%lu  %s  preset=%d",
                 (unsigned long)cb_count,
                 (unsigned long)cb_process_cycles,
                 (unsigned long)cb_max_cycles,
                 effect_active ? "ACTIVE" : "BYPASS",
-                ng_active ? "ON" : "off");
-            LOG("  knobs k1=%.3f k2=%.3f k3=%.3f k4=%.3f k6=%.3f",
-                k1,
-                k2,
-                k3,
-                k4,
-                k6);
-            LOG("  ftsw1=%d ftsw2=%d  sw1=%d sw2=%d sw3=%d sw4=%d",
-                footswitch1.Pressed() ? 1 : 0,
-                footswitch2.Pressed() ? 1 : 0,
-                sw1.Pressed() ? 1 : 0,
-                sw2.Pressed() ? 1 : 0,
-                sw3.Pressed() ? 1 : 0,
-                sw4.Pressed() ? 1 : 0);
+                current_preset + 1);
+            LOG("  knobs gain=%.3f vol=%.3f bass=%.3f mid=%.3f treble=%.3f gate=%.3f",
+                knob_gain,
+                knob_volume,
+                knob_bass,
+                knob_mid,
+                knob_treble,
+                knob_gate_threshold);
+            LOG("  ftsw=%d  rot1=%d rot2=%d rot3=%d rot4=%d",
+                footswitch.Pressed() ? 1 : 0,
+                rotary1.Pressed() ? 1 : 0,
+                rotary2.Pressed() ? 1 : 0,
+                rotary3.Pressed() ? 1 : 0,
+                rotary4.Pressed() ? 1 : 0);
             LOG("  gain=%.2f vol=%.2f eq[%.1f %.1f %.1f]",
                 gain,
                 volume,
