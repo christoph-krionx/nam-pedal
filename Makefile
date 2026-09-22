@@ -1,6 +1,11 @@
 TARGET = NAMPedal
 
-GCC_PATH = /Library/DaisyToolchain/0.2.0/arm/bin
+# Empty by default: libDaisy's core Makefile falls back to plain
+# arm-none-eabi-gcc/g++/etc. resolved from PATH when GCC_PATH is unset.
+# If your toolchain isn't on PATH, point at it without editing this file:
+#   make GCC_PATH=/path/to/toolchain/bin
+#   export GCC_PATH=/path/to/toolchain/bin   (in your shell profile)
+GCC_PATH ?=
 
 LIBDAISY_DIR = ../../libDaisy
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core

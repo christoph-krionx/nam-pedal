@@ -51,6 +51,38 @@ make
 
 This cross-compiles for the STM32H750 (Cortex-M7) using `BOOT_QSPI` app type for the larger binary size NAM requires.
 
+### Toolchain path
+
+`make` needs `arm-none-eabi-gcc` (and friends) to be a complete toolchain —
+one that bundles the newlib C library, not just the compiler binaries. If
+it's missing (e.g. some package-manager builds, like Homebrew's on Linux,
+ship the compiler without newlib), the very first file fails to compile with:
+
+```
+fatal error: stdint.h: No such file or directory
+```
+
+If you hit that, install a complete toolchain instead — either
+[DaisyToolchain](https://github.com/electro-smith/DaisyToolchain) or the
+[Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads)
+both work.
+
+By default the Makefile leaves `GCC_PATH` empty, which makes libDaisy's
+`core/Makefile` fall back to whatever `arm-none-eabi-gcc` it finds on your
+`PATH`. If your toolchain isn't on `PATH`, point at it **without editing the
+Makefile** — either per invocation:
+
+```bash
+make GCC_PATH=/path/to/toolchain/bin
+```
+
+or once, for every future `make` in this shell, by adding this to your shell
+profile (`~/.bashrc`, `~/.zshrc`, etc.):
+
+```bash
+export GCC_PATH=/path/to/toolchain/bin
+```
+
 ## Flashing
 
 Because this app leverages Daisy's QSPI flash memory to accommodate program size, a *bootloader* must be flashed before the main program.
