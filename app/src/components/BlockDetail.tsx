@@ -9,7 +9,7 @@ import { t3kClient } from '../client';
 import { CrossOriginImage } from './CrossOriginImage';
 
 const GEAR: Record<string, string> = {
-  amp: 'Amp', 'full-rig': 'Amp + Cab', 'amp-cab': 'Amp + Cab', pedal: 'Pedal', outboard: 'Outboard', ir: 'Cabinet',
+  amp: 'Amp', 'full-rig': 'Amp + Cab', 'amp-cab': 'Amp + Cab', pedal: 'Pedal', outboard: 'Outboard', cab: 'Cab', ir: 'Cab',
 };
 
 const compact = (n: number) => Intl.NumberFormat('en', { notation: 'compact' }).format(n);

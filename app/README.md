@@ -11,7 +11,7 @@ four presets of the DIY pedal (Daisy Seed) over USB.
    preset 1 to 4.
 3. **Build the chain.** Each preset is a two-block chain like the plugin: NAM on
    block 1, optional cab IR on block 2. Clicking an empty block opens the TONE3000
-   select flow (filtered to A2 NAM or IR tones); the first model is loaded and
+   select flow (filtered to A2 NAM tones, or cab IRs); the first model is loaded and
    validated against the pedal's fixed A2 nano architecture (1871 weights). Click a
    filled block to step through the tone's models and preview them in the browser
    (`neural-amp-modeler-wasm`), swap the tone, or remove it.
