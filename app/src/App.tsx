@@ -2,18 +2,19 @@ import { useState, useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
 import { PUBLISHABLE_KEY, REDIRECT_URI } from './config';
 import { startOAuthPopup, handleOAuthCallbackFromPopup } from './tone3000-client';
+import type { OAuthPopupOptions } from './tone3000-client';
 import { t3kClient } from './client';
-import type { Tone, Model, EmbeddedUser } from './types';
-import type { PresetSlots } from './lib/flash';
-import { analyzeNamFile, isPedalCompatible, emptySlots, isNamFile, isIrFile } from './lib/flash';
+import type { Model, EmbeddedUser } from './types';
+import type { Preset, BlockKind } from './lib/flash';
+import { analyzeNamFile, isPedalCompatible, emptyPresets, isNamFile, isIrFile } from './lib/flash';
 import { PEDAL_WEIGHT_COUNT } from './lib/namb';
 import { Header } from './components/Header';
 import { Splash } from './components/Splash';
-import { ToneBlock } from './components/ToneBlock';
+import { Chain } from './components/Chain';
+import { BlockDetail } from './components/BlockDetail';
 import { Pedal } from './components/Pedal';
 import { FlashDialog } from './components/FlashDialog';
 import { Spinner } from './components/Spinner';
-import { T3kMark } from './components/Brand';
 
 // Popup side of the OAuth flow: relay the callback to the opener and close.
 // BroadcastChannel covers the case where window.opener was cleared by a cross-origin login.
@@ -39,36 +40,58 @@ import { T3kMark } from './components/Brand';
   window.close();
 })();
 
-const LOGIN_OPTIONS = { menubar: true };
-const SELECT_OPTIONS = { prompt: 'select_tone' as const, gears: 'full-rig', platform: 'nam', menubar: true, architecture: 2 };
-
-function NoTone({ busy, onBrowse }: { busy: boolean; onBrowse: () => void }) {
-  return (
-    <section className="card no-tone">
-      <span className="label">Tone</span>
-      <p className="muted">Pick a preset on the knob, then browse TONE3000 for a tone to load into it.</p>
-      <button className="btn btn-primary" disabled={busy} onClick={onBrowse}>
-        <T3kMark />
-        {busy ? 'Waiting for TONE3000' : 'Browse TONE3000'}
-      </button>
-    </section>
-  );
-}
+const LOGIN_OPTIONS: OAuthPopupOptions = { menubar: true };
+const SELECT_OPTIONS: Record<BlockKind, OAuthPopupOptions> = {
+  nam: { prompt: 'select_tone', format: 'nam', architecture: 2, menubar: true },
+  ir: { prompt: 'select_tone', format: 'ir', menubar: true },
+};
 
 export default function App() {
   const [user, setUser] = useState<EmbeddedUser | null>(null);
   const [entered, setEntered] = useState(false);
-  const [tone, setTone] = useState<Tone | null>(null);
-  const [models, setModels] = useState<Model[]>([]);
-  const [modelIdx, setModelIdx] = useState(0);
-  const [slots, setSlots] = useState<PresetSlots>(emptySlots);
-  const [preset, setPreset] = useState(0);
+  const [presets, setPresets] = useState<Preset[]>(emptyPresets);
+  const [selected, setSelected] = useState(0);
+  const [block, setBlock] = useState<BlockKind>('nam');
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(false);
   const [browsing, setBrowsing] = useState(false);
   const [flashOpen, setFlashOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const popup = useRef<Window | null>(null);
+  // Which block the open select popup is for.
+  const target = useRef<{ preset: number; kind: BlockKind }>({ preset: 0, kind: 'nam' });
+
+  const updatePreset = (i: number, fn: (p: Preset) => Preset) =>
+    setPresets((prev) => prev.map((p, j) => (j === i ? fn(p) : p)));
+
+  // Download and validate a .nam; store the parsed JSON on the block or report why not.
+  const checkNam = async (i: number, model: Model) => {
+    setChecking(true);
+    setError(null);
+    try {
+      const res = await t3kClient.fetchFile(model.model_url);
+      if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+      const { namJson, numWeights, architecture } = analyzeNamFile(await res.text());
+      if (!isPedalCompatible(numWeights)) {
+        throw new Error(`${architecture} model with ${numWeights} weights. The pedal runs A2 nano models only (${PEDAL_WEIGHT_COUNT} weights).`);
+      }
+      updatePreset(i, (p) => (p.nam?.model.id === model.id ? { ...p, nam: { ...p.nam, namJson } } : p));
+    } catch (err) {
+      setError(`${model.name}: ${(err as Error).message}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const setModel = (model: Model) => {
+    const i = selected;
+    if (block === 'nam') {
+      updatePreset(i, (p) => (p.nam ? { ...p, nam: { ...p.nam, model, namJson: null } } : p));
+      checkNam(i, model);
+    } else {
+      updatePreset(i, (p) => (p.ir ? { ...p, ir: { ...p.ir, model } } : p));
+    }
+  };
 
   // Restore a stored session.
   useEffect(() => {
@@ -91,14 +114,26 @@ export default function App() {
       if (!user) t3kClient.getUser().then(setUser).catch(() => {});
       if (result.canceled || !result.toneId) return;
 
+      const { preset: i, kind } = target.current;
       setLoading(true);
       try {
-        const [t, m] = await Promise.all([t3kClient.getTone(result.toneId), t3kClient.listModels(result.toneId, 2)]);
-        setTone(t);
-        setModels(m.data);
-        setModelIdx(0);
-      } catch {
-        setError('Could not load the tone. Try again.');
+        const [tone, list] = await Promise.all([
+          t3kClient.getTone(result.toneId),
+          t3kClient.listModels(result.toneId),
+        ]);
+        const models = list.data.filter(kind === 'nam' ? isNamFile : isIrFile);
+        if (models.length === 0) throw new Error(kind === 'nam' ? 'No A2 models in this tone.' : 'No IR files in this tone.');
+        const blk = { tone, models, model: models[0] };
+        if (kind === 'nam') {
+          updatePreset(i, (p) => ({ ...p, nam: { ...blk, namJson: null } }));
+          setLoading(false);
+          await checkNam(i, models[0]);
+        } else {
+          updatePreset(i, (p) => ({ ...p, ir: blk }));
+        }
+        setBlock(kind);
+      } catch (err) {
+        setError((err as Error).message || 'Could not load the tone. Try again.');
       } finally {
         setLoading(false);
       }
@@ -125,43 +160,26 @@ export default function App() {
     return () => clearInterval(id);
   }, [browsing]);
 
-  const open = async (options: typeof LOGIN_OPTIONS | typeof SELECT_OPTIONS) => {
+  const open = async (options: OAuthPopupOptions) => {
     setError(null);
     setBrowsing(true);
     popup.current = await startOAuthPopup(PUBLISHABLE_KEY, REDIRECT_URI, options);
   };
   const signedIn = !!user || t3kClient.isConnected();
-  const browse = () => open(SELECT_OPTIONS);
   const enter = () => (signedIn ? setEntered(true) : open(LOGIN_OPTIONS));
-
-  const load = async (model: Model) => {
-    setChecking(true);
-    setError(null);
-    try {
-      const res = await t3kClient.fetchFile(model.model_url);
-      if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-      const { namJson, numWeights, architecture } = analyzeNamFile(await res.text());
-      if (!isPedalCompatible(numWeights)) {
-        setError(
-          `${model.name} is a ${architecture} model with ${numWeights} weights. ` +
-            `The pedal runs A2 nano models only (${PEDAL_WEIGHT_COUNT} weights).`,
-        );
-        return;
-      }
-      setSlots((prev) => prev.map((s, i) => (i === preset ? { model, namJson, ir: s?.ir ?? null } : s)));
-    } catch (err) {
-      setError(`Could not load ${model.name}: ${(err as Error).message}`);
-    } finally {
-      setChecking(false);
-    }
+  const select = (kind: BlockKind) => {
+    target.current = { preset: selected, kind };
+    open(SELECT_OPTIONS[kind]);
   };
+  const remove = (kind: BlockKind) => updatePreset(selected, (p) => ({ ...p, [kind]: null }));
 
-  const namModels = models.filter(isNamFile);
-  const irs = models.filter(isIrFile);
+  const preset = presets[selected];
+  const detail = preset[block] ?? preset.nam ?? preset.ir;
+  const detailKind: BlockKind = detail === preset.nam ? 'nam' : 'ir';
 
   return (
     <>
-      <Header user={user} onBrowse={entered ? browse : null} />
+      <Header user={user} />
 
       {error && (
         <div className="banner banner-error banner-top">
@@ -176,37 +194,34 @@ export default function App() {
 
       {entered && (
         <main className="main">
-          {loading ? (
-            <section className="card no-tone">
-              <Spinner />
-              <span className="muted">Loading tone</span>
-            </section>
-          ) : tone ? (
-            <ToneBlock
-              tone={tone}
-              models={namModels}
-              index={modelIdx}
+          <section className="card">
+            <div className="section-title">
+              <span className="label">Preset {selected + 1}</span>
+              {(loading || browsing) && <Spinner />}
+            </div>
+            <Chain
               preset={preset}
-              busy={checking}
-              onIndex={setModelIdx}
-              onLoad={load}
+              active={detailKind}
+              checking={checking}
+              onOpen={setBlock}
+              onSwap={select}
+              onRemove={remove}
             />
-          ) : (
-            <NoTone busy={browsing} onBrowse={browse} />
-          )}
+            {detail && <BlockDetail kind={detailKind} block={detail} checking={checking} onModel={setModel} />}
+          </section>
           <Pedal
-            slots={slots}
-            selected={preset}
-            irs={irs}
-            onSelect={setPreset}
-            onClear={(i) => setSlots((prev) => prev.map((s, j) => (j === i ? null : s)))}
-            onSetIr={(i, ir) => setSlots((prev) => prev.map((s, j) => (j === i && s ? { ...s, ir } : s)))}
+            presets={presets}
+            selected={selected}
+            onSelect={(i) => {
+              setSelected(i);
+              setBlock('nam');
+            }}
             onFlash={() => setFlashOpen(true)}
           />
         </main>
       )}
 
-      {flashOpen && <FlashDialog slots={slots} onClose={() => setFlashOpen(false)} />}
+      {flashOpen && <FlashDialog presets={presets} onClose={() => setFlashOpen(false)} />}
     </>
   );
 }

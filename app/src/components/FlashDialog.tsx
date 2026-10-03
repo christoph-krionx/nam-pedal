@@ -1,8 +1,8 @@
 // Build bank -> DFU trigger -> WebUSB flash.
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import type { PresetSlots } from '../lib/flash';
-import { buildBankImage, flashBank } from '../lib/flash';
+import type { Preset } from '../lib/flash';
+import { buildBankImage, flashBank, isReady } from '../lib/flash';
 import { triggerDfuOverSerial, isWebSerialSupported } from '../lib/serial';
 import { isWebUsbSupported } from '../lib/webdfu';
 import { t3kClient } from '../client';
@@ -25,22 +25,22 @@ const isDismiss = (err: unknown) => (err as DOMException)?.name === 'NotFoundErr
 const message = (err: unknown) => String((err as Error)?.message ?? err);
 
 interface Props {
-  slots: PresetSlots;
+  presets: Preset[];
   onClose: () => void;
 }
 
-export function FlashDialog({ slots, onClose }: Props) {
+export function FlashDialog({ presets, onClose }: Props) {
   const [phase, setPhase] = useState<Phase>({ step: 'building' });
 
   useEffect(() => {
     let canceled = false;
-    buildBankImage(slots, fetchFile)
+    buildBankImage(presets, fetchFile)
       .then((bank) => !canceled && setPhase({ step: 'ready', bank, triggering: false }))
       .catch((err) => !canceled && setPhase({ step: 'error', message: message(err), bank: null }));
     return () => {
       canceled = true;
     };
-  }, [slots]);
+  }, [presets]);
 
   const trigger = async (bank: Uint8Array) => {
     setPhase({ step: 'ready', bank, triggering: true });
@@ -68,7 +68,7 @@ export function FlashDialog({ slots, onClose }: Props) {
   };
 
   const busy = phase.step === 'flashing';
-  const filled = slots.filter(Boolean).length;
+  const filled = presets.filter(isReady).length;
 
   return (
     <div className="backdrop" onClick={busy ? undefined : onClose}>
@@ -90,7 +90,7 @@ export function FlashDialog({ slots, onClose }: Props) {
         {phase.step === 'ready' && (
           <>
             <p className="muted">
-              {filled} of {slots.length} presets, {(phase.bank.length / 1024).toFixed(1)} KB.
+              {filled} of {presets.length} presets, {(phase.bank.length / 1024).toFixed(1)} KB.
               {!isWebUsbSupported() && ' WebUSB is not supported in this browser; use Chrome or Edge.'}
             </p>
             <div className="step">

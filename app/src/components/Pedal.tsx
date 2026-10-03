@@ -1,18 +1,24 @@
-// Pedal panel: rotary preset knob with 4 red LEDs, preset rows, flash button.
+// Pedal panel: faceplate with the rotary preset knob and 4 red LEDs, plus the flash button.
 import { useEffect, useRef, useState } from 'react';
-import { X, Zap } from 'lucide-react';
-import type { Model } from '../types';
-import type { PresetSlots } from '../lib/flash';
+import { Zap } from 'lucide-react';
+import type { Preset } from '../lib/flash';
+import { isReady } from '../lib/flash';
 
-// Knob geometry in SVG units. LEDs sit on an arc above the knob, one per preset.
+// Faceplate geometry in SVG units, after the pedal wireframe: an LED arc band over the knob.
 const VIEW_W = 300;
+const VIEW_H = 232;
 const CX = 150;
-const CY = 160;
-const LED_R = 104;
-const LABEL_R = 128;
-const TIP = 76; // pointer length from center
-const ANGLES = [-60, -20, 20, 60]; // degrees from 12 o'clock
-const SWEEP = 80; // drag limit past the end positions
+const CY = 162;
+const BAND_OUTER = 134;
+const BAND_INNER = 100;
+const LED_R = 117;
+const LABEL_R = 146;
+const BOSS_R = 40;
+const POINTER_W = 34;
+const TIP = 95; // pointer reach from center, just short of the band's inner edge
+const TAIL = 58; // pointer overhang past the center
+const ANGLES = [-70, -24, 24, 70]; // degrees from 12 o'clock
+const SWEEP = 85; // drag limit past the end positions
 
 const polar = (r: number, deg: number) => {
   const a = (deg * Math.PI) / 180;
@@ -22,24 +28,23 @@ const polar = (r: number, deg: number) => {
 const nearest = (deg: number) =>
   ANGLES.reduce((best, a, i) => (Math.abs(a - deg) < Math.abs(ANGLES[best] - deg) ? i : best), 0);
 
-// Chicken-head outline, pointing up: round rear, straight taper, chamfered nose.
-const KNOB_PATH = [
-  `M ${CX - 26} ${CY + 10}`,
-  `L ${CX - 11} ${CY - TIP + 10}`,
-  `L ${CX - 6} ${CY - TIP}`,
-  `L ${CX + 6} ${CY - TIP}`,
-  `L ${CX + 11} ${CY - TIP + 10}`,
-  `L ${CX + 26} ${CY + 10}`,
-  `A 26 26 0 1 1 ${CX - 26} ${CY + 10}`,
+// Half annulus, flat ends on the knob's center line.
+const BAND_PATH = [
+  `M ${CX - BAND_OUTER} ${CY}`,
+  `A ${BAND_OUTER} ${BAND_OUTER} 0 0 1 ${CX + BAND_OUTER} ${CY}`,
+  `L ${CX + BAND_INNER} ${CY}`,
+  `A ${BAND_INNER} ${BAND_INNER} 0 0 0 ${CX - BAND_INNER} ${CY}`,
   'Z',
 ].join(' ');
 
+
 interface FaceProps {
   selected: number;
+  ready: boolean[];
   onSelect: (i: number) => void;
 }
 
-function Face({ selected, onSelect }: FaceProps) {
+function Face({ selected, ready, onSelect }: FaceProps) {
   const svg = useRef<SVGSVGElement>(null);
   const [drag, setDrag] = useState<number | null>(null);
   const angle = drag ?? ANGLES[selected];
@@ -69,16 +74,19 @@ function Face({ selected, onSelect }: FaceProps) {
   }, [drag, selected, onSelect]);
 
   return (
-    <svg ref={svg} className="pedal-face" viewBox={`0 0 ${VIEW_W} 212`} role="group" aria-label="Preset selector">
+    <svg ref={svg} className="face" viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} role="group" aria-label="Preset selector">
+      <rect width={VIEW_W} height={VIEW_H} rx={14} className="face-bg" />
+      <image href="/brand/t3k.svg" x={16} y={16} height={12} />
+      <path d={BAND_PATH} className="face-band" />
       {ANGLES.map((deg, i) => {
         const led = polar(LED_R, deg);
         const label = polar(LABEL_R, deg);
         const on = i === selected;
         return (
           <g key={i} className="hit" onClick={() => onSelect(i)} role="button" aria-label={`Preset ${i + 1}`}>
-            <circle cx={led.x} cy={led.y} r={18} fill="transparent" />
+            <circle cx={led.x} cy={led.y} r={16} fill="transparent" />
             <circle cx={led.x} cy={led.y} r={7} className={`led${on ? ' on' : ''}`} />
-            <text x={label.x} y={label.y + 4} className={`led-label${on ? ' on' : ''}`}>
+            <text x={label.x} y={label.y + 4} className={`led-label${ready[i] ? ' ready' : ''}`}>
               {i + 1}
             </text>
           </g>
@@ -94,80 +102,33 @@ function Face({ selected, onSelect }: FaceProps) {
         transform={`rotate(${angle} ${CX} ${CY})`}
         onPointerDown={() => setDrag(angle)}
       >
-        <path d={KNOB_PATH} className="knob-body" />
-        <line x1={CX} y1={CY - TIP + 6} x2={CX} y2={CY - 22} className="knob-stripe" />
+        <circle cx={CX} cy={CY} r={BOSS_R} className="knob-body" />
+        <rect x={CX - POINTER_W / 2} y={CY - TIP} width={POINTER_W} height={TIP + TAIL} rx={10} className="knob-body" />
+        <rect x={CX - 2.5} y={CY - TIP + 8} width={5} height={30} rx={2.5} className="knob-stripe" />
       </g>
     </svg>
   );
 }
 
 interface Props {
-  slots: PresetSlots;
+  presets: Preset[];
   selected: number;
-  irs: Model[];
   onSelect: (i: number) => void;
-  onClear: (i: number) => void;
-  onSetIr: (i: number, ir: Model | null) => void;
   onFlash: () => void;
 }
 
-export function Pedal({ slots, selected, irs, onSelect, onClear, onSetIr, onFlash }: Props) {
-  const filled = slots.filter(Boolean).length;
+export function Pedal({ presets, selected, onSelect, onFlash }: Props) {
+  const ready = presets.map(isReady);
+  const count = ready.filter(Boolean).length;
 
   return (
     <aside className="card">
       <div className="section-title">
         <span className="label">Pedal</span>
-        <span className="label">{filled}/{slots.length}</span>
+        <span className="label">{count}/{presets.length}</span>
       </div>
-
-      <Face selected={selected} onSelect={onSelect} />
-
-      <div className="presets">
-        {slots.map((p, i) => (
-          <div
-            key={i}
-            className={`preset${i === selected ? ' selected' : ''}`}
-            onClick={() => onSelect(i)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => e.key === 'Enter' && onSelect(i)}
-          >
-            <span className="preset-num">{i + 1}</span>
-            <div className="preset-body">
-              <span className={`preset-name${p ? '' : ' empty'}`}>{p ? p.model.name : 'Empty'}</span>
-              {p && irs.length > 0 && (
-                <label className="preset-ir" onClick={(e) => e.stopPropagation()}>
-                  IR
-                  <select
-                    value={p.ir ? String(p.ir.id) : ''}
-                    onChange={(e) => onSetIr(i, irs.find((m) => String(m.id) === e.target.value) ?? null)}
-                  >
-                    <option value="">None</option>
-                    {irs.map((ir) => (
-                      <option key={ir.id} value={String(ir.id)}>{ir.name}</option>
-                    ))}
-                  </select>
-                </label>
-              )}
-            </div>
-            {p && (
-              <button
-                className="btn-icon plain"
-                aria-label="Clear preset"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClear(i);
-                }}
-              >
-                <X size={14} />
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-
-      <button className="btn btn-primary btn-block pedal-flash" disabled={filled === 0} onClick={onFlash}>
+      <Face selected={selected} ready={ready} onSelect={onSelect} />
+      <button className="btn btn-primary btn-block pedal-flash" disabled={count === 0} onClick={onFlash}>
         <Zap size={14} />
         Flash to pedal
       </button>

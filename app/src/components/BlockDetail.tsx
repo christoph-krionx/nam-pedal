@@ -1,33 +1,29 @@
-// Tone details and model selector, laid out like the plugin's BLOCK view.
+// Tone details and model selector for the active chain block.
 import { useCallback, useEffect, useRef } from 'react';
 import { ChevronLeft, ChevronRight, Download, Bookmark, Folder } from 'lucide-react';
 import { T3kSlimPlayer, DEFAULT_IRS, DEFAULT_INPUTS } from 'neural-amp-modeler-wasm';
 import 'neural-amp-modeler-wasm/dist/styles.css';
-import type { Tone, Model } from '../types';
+import type { Model } from '../types';
+import type { Block, BlockKind } from '../lib/flash';
 import { t3kClient } from '../client';
 import { CrossOriginImage } from './CrossOriginImage';
 
 const GEAR: Record<string, string> = {
-  amp: 'Amp', 'full-rig': 'Amp + Cab', pedal: 'Pedal', outboard: 'Outboard', ir: 'Cabinet',
-};
-const PLATFORM: Record<string, string> = {
-  nam: 'NAM', ir: 'IR', 'aida-x': 'AIDA-X', 'aa-snapshot': 'Snapshot', proteus: 'Proteus',
+  amp: 'Amp', 'full-rig': 'Amp + Cab', 'amp-cab': 'Amp + Cab', pedal: 'Pedal', outboard: 'Outboard', ir: 'Cabinet',
 };
 
 const compact = (n: number) => Intl.NumberFormat('en', { notation: 'compact' }).format(n);
 
 interface Props {
-  tone: Tone;
-  models: Model[];
-  index: number;
-  preset: number; // 0-based target preset
-  busy: boolean;
-  onIndex: (i: number) => void;
-  onLoad: (model: Model) => void;
+  kind: BlockKind;
+  block: Block;
+  checking: boolean;
+  onModel: (model: Model) => void;
 }
 
-export function ToneBlock({ tone, models, index, preset, busy, onIndex, onLoad }: Props) {
-  const model = models[index];
+export function BlockDetail({ kind, block, checking, onModel }: Props) {
+  const { tone, models, model } = block;
+  const index = models.indexOf(model);
   const blobUrl = useRef<string | null>(null);
 
   useEffect(() => () => {
@@ -48,11 +44,7 @@ export function ToneBlock({ tone, models, index, preset, busy, onIndex, onLoad }
   }, [model]);
 
   return (
-    <section className="card">
-      <div className="section-title">
-        <span className="label">Tone</span>
-      </div>
-
+    <div className="detail">
       <div className="tone">
         {tone.images?.[0] ? (
           <CrossOriginImage src={tone.images[0]} alt="" className="tone-image" />
@@ -63,8 +55,7 @@ export function ToneBlock({ tone, models, index, preset, busy, onIndex, onLoad }
           <h2 className="tone-title">{tone.title}</h2>
           <div className="tone-row">
             <span>{GEAR[tone.gear] ?? tone.gear}</span>
-            <span className="badge">{PLATFORM[tone.platform] ?? tone.platform}</span>
-            <span className="badge">A2</span>
+            <span className="badge">{kind === 'nam' ? 'NAM A2' : 'IR'}</span>
           </div>
           <div className="tone-row">
             <span className="tone-stat"><Download /> {compact(tone.downloads_count)}</span>
@@ -81,34 +72,25 @@ export function ToneBlock({ tone, models, index, preset, busy, onIndex, onLoad }
         </div>
       </div>
 
-      {model ? (
-        <>
-          <div className="model-select">
-            <div className="model-select-bar">
-              <button className="btn-icon plain" disabled={index === 0} onClick={() => onIndex(index - 1)} aria-label="Previous model">
-                <ChevronLeft size={16} />
-              </button>
-              <span className="model-select-name">{model.name}</span>
-              <button className="btn-icon plain" disabled={index === models.length - 1} onClick={() => onIndex(index + 1)} aria-label="Next model">
-                <ChevronRight size={16} />
-              </button>
-              <span className="model-select-count">
-                <Folder /> {index + 1}/{models.length}
-              </span>
-            </div>
-            <div className="neural-amp-modeler">
-              <T3kSlimPlayer id={`model-${model.id}`} getData={getData} />
-            </div>
+      <div className="model-select">
+        <div className={`model-select-bar${checking ? ' off' : ''}`}>
+          <button className="btn-icon plain" disabled={checking || index <= 0} onClick={() => onModel(models[index - 1])} aria-label="Previous model">
+            <ChevronLeft size={16} />
+          </button>
+          <span className="model-select-name">{model.name}</span>
+          <button className="btn-icon plain" disabled={checking || index >= models.length - 1} onClick={() => onModel(models[index + 1])} aria-label="Next model">
+            <ChevronRight size={16} />
+          </button>
+          <span className="model-select-count">
+            <Folder /> {index + 1}/{models.length}
+          </span>
+        </div>
+        {kind === 'nam' && (
+          <div className="neural-amp-modeler">
+            <T3kSlimPlayer id={`model-${model.id}`} getData={getData} />
           </div>
-          <div className="model-actions">
-            <button className="btn btn-primary" disabled={busy} onClick={() => onLoad(model)}>
-              {busy ? 'Checking model' : `Load into preset ${preset + 1}`}
-            </button>
-          </div>
-        </>
-      ) : (
-        <p className="muted model-select">No A2 models in this tone.</p>
-      )}
-    </section>
+        )}
+      </div>
+    </div>
   );
 }

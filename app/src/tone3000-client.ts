@@ -16,7 +16,7 @@ export type OAuthCallbackResult =
 export interface OAuthPopupOptions {
   prompt?: 'select_tone'; // omit for plain login
   gears?: string; // underscore-separated, e.g. 'amp_pedal'
-  platform?: string;
+  format?: 'nam' | 'ir';
   architecture?: number;
   menubar?: boolean;
 }
@@ -79,7 +79,7 @@ export async function startOAuthPopup(
   };
   if (options.prompt) params.prompt = options.prompt;
   if (options.gears) params.gears = options.gears;
-  if (options.platform) params.platform = options.platform;
+  if (options.format) params.format = options.format;
   if (options.architecture) params.architecture = String(options.architecture);
   if (options.menubar) params.menubar = 'true';
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
@@ -213,9 +213,9 @@ export class T3KClient {
     return res.json();
   }
 
-  async listModels(toneId: number | string, architecture?: number): Promise<PaginatedResponse<Model>> {
-    const qs = new URLSearchParams({ tone_id: String(toneId) });
-    if (architecture != null) qs.set('architecture', String(architecture));
+  // The pedal runs A2 only. IR files have no architecture and pass through the filter.
+  async listModels(toneId: number | string): Promise<PaginatedResponse<Model>> {
+    const qs = new URLSearchParams({ tone_id: String(toneId), architecture: '2' });
     const res = await this.fetch(`/api/v1/models?${qs}`);
     if (!res.ok) throw new Error(`listModels failed: ${res.status}`);
     return res.json();
