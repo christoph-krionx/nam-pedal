@@ -100,9 +100,9 @@ static constexpr Pin ToPin(dsy_gpio_pin p)
 
 // Order must match T3kPedal::Knob (INPUT_GAIN, OUTPUT_VOLUME, BASS, MID,
 // TREBLE, NOISE_GATE_THRESHOLD) — each entry must be an ADC-capable Seed
-// pin (seed::A0..A11).
+// pin (seed::A0..A11). The PCB wires the pots to ADC_0..ADC_5 in that order.
 static constexpr Pin kKnobPins[6]
-    = {seed::A1, seed::A2, seed::A3, seed::A4, seed::A5, seed::A6};
+    = {seed::A0, seed::A1, seed::A2, seed::A3, seed::A4, seed::A5};
 static Switch footswitch;
 static Switch rotary1, rotary2, rotary3, rotary4;
 static GPIO   led_status;
@@ -302,6 +302,15 @@ static bool LoadModel(uint32_t idx)
         (unsigned long)bank->num_models,
         e.name,
         (unsigned long)size);
+
+    // The loader app always writes 4 entries (one per rotary position) and
+    // marks unassigned presets with a zero-size blob. Treat those as "no
+    // model": the caller leaves model_loaded=false and audio passes through.
+    if(size == 0)
+    {
+        LOG("  preset is empty (no model assigned)");
+        return false;
+    }
 
     if(size < 32)
     {
@@ -881,6 +890,15 @@ int main(void)
                 rotary2.Pressed() ? 1 : 0,
                 rotary3.Pressed() ? 1 : 0,
                 rotary4.Pressed() ? 1 : 0);
+            // GPIO::Read() returns the pin's *input data register*, i.e. the
+            // actual voltage on the pin even in output mode. A pin commanded
+            // high that reads back 0 is being pulled down externally.
+            LOG("  led pins (readback): status=%d p1=%d p2=%d p3=%d p4=%d",
+                led_status.Read() ? 1 : 0,
+                led_preset[0].Read() ? 1 : 0,
+                led_preset[1].Read() ? 1 : 0,
+                led_preset[2].Read() ? 1 : 0,
+                led_preset[3].Read() ? 1 : 0);
             LOG("  gain=%.2f vol=%.2f eq[%.1f %.1f %.1f]",
                 gain,
                 volume,
