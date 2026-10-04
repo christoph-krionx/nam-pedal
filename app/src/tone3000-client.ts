@@ -19,6 +19,7 @@ export interface OAuthPopupOptions {
   format?: 'nam' | 'ir';
   architecture?: number;
   menubar?: boolean;
+  preview?: boolean; // audition players in the select flow
 }
 
 // PKCE
@@ -82,6 +83,7 @@ export async function startOAuthPopup(
   if (options.format) params.format = options.format;
   if (options.architecture) params.architecture = String(options.architecture);
   if (options.menubar) params.menubar = 'true';
+  if (options.preview) params.preview = 'true';
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
   const width = 480;

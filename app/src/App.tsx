@@ -42,8 +42,8 @@ import { Spinner } from './components/Spinner';
 
 const LOGIN_OPTIONS: OAuthPopupOptions = { menubar: true };
 const SELECT_OPTIONS: Record<BlockKind, OAuthPopupOptions> = {
-  nam: { prompt: 'select_tone', format: 'nam', architecture: 2, menubar: true },
-  ir: { prompt: 'select_tone', format: 'ir', gears: 'cab', menubar: true },
+  nam: { prompt: 'select_tone', format: 'nam', architecture: 2, menubar: true, preview: true },
+  ir: { prompt: 'select_tone', format: 'ir', gears: 'cab', menubar: true, preview: true },
 };
 
 export default function App() {
