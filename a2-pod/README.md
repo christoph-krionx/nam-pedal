@@ -34,7 +34,8 @@ abgewiesen. Der alte main-Branch samt C++-Konverter bleibt separat erhalten.
    `FS mount: OK`, `Model load: OK`, Benchmark unter 1 ms und
    `Audio engine started`. USB-Serial ist optional; die Firmware startet
    auch ohne geoeffneten Monitor.
-5. Knopf 1 schaltet vom roten Bypass zur gruenen Modellverarbeitung.
+5. Knopf 1 schaltet vom roten Bypass zur Modellverarbeitung.
+   LED 1: Gruen = NAM ohne Gate, Cyan = NAM mit eingeschaltetem Gate.
    Poti 1 regelt Eingangsgain, Poti 2 die Ausgangslautstaerke.
    Die periodische `max`-Zykluszahl sollte unter 480000 bleiben. Das misst
    nur die Inferenz; fuer den gesamten Callback ist zusaetzliche Reserve
@@ -42,6 +43,35 @@ abgewiesen. Der alte main-Branch samt C++-Konverter bleibt separat erhalten.
 
 Flashen ersetzt das bisherige Programm. Bootloader nur installieren, wenn
 er fehlt; eine vorhandene funktionierende Installation reicht aus.
+
+## Eingangspegel und Noise Gate
+
+LED 2 misst den linken Eingang vor Gain, Gate und NAM, auch im Bypass.
+Gruen bedeutet Signal ueber 0.01 (-40 dBFS); ein 20-Hz-DC-Tracker entfernt
+Gleichspannungsanteile nur fuer diese Signalerkennung. Rot bedeutet mindestens
+digitale Vollaussteuerung (1.0). Rot bleibt 500 ms sichtbar, Gruen 80 ms.
+Bei kleineren Pegeln ist die LED aus. Die Anzeige stammt aus LevelMeter;
+die Peak-Uebergabe an die Hauptschleife ist gegen Interrupts geschuetzt.
+
+Encoder drehen: Gate-Schwelle um 1 dB pro Schritt aendern, im Uhrzeigersinn
+hoeher (staerkeres Gate). Bereich -80 bis -20 dBFS, Startwert -50 dBFS.
+Encoder druecken: Gate ein/aus. Es startet ausgeschaltet. Die Einstellung
+wird auch bei ausgeschaltetem Gate geaendert; USB-Serial zeigt den Wert.
+Einstellungen sind fluechtig und werden beim Neustart zurueckgesetzt.
+
+Das Gate erkennt den rohen Eingang unabhaengig vom Gain-Poti. Es verwendet
+6 dB Hysterese, mindestens 20 ms Haltezeit, 1 ms Oeffnungsrampe und 50 ms
+Schliessrampe. Der Detektor faellt mit einer Zeitkonstante von 10 ms ab.
+Es daempft den NAM-Eingang und den Modell-Ausgang, damit auch modellinternes
+Rauschen bei geschlossenem Gate stumm ist. Bypass bleibt ungegatet.
+Hoehere Schwellen koennen leise Toene und ausklingende Noten abschneiden.
+`total_max` in der Serial-Ausgabe misst zusaetzlich die Callback-Verarbeitung
+inklusive Gate/Pegelmessung; die Inferenzwerte `cycles`/`max` bleiben erhalten.
+
+Gate-Hosttests bestanden: ausgeschaltetes Gate transparent, Rauschboden
+geschlossen, Attack, Hysterese, Hold, Release und weiches Abschalten.
+Die neue Gate/Pegel-Version muss noch auf dem Pod gehoert und zeitlich
+geprueft werden; die numerische NAM-Engine bleibt unveraendert.
 
 ## Modell erneut konvertieren / Firmware bauen
 
@@ -64,8 +94,8 @@ Abbruch bei kurzen SD-Lesevorgaengen.
 
 ## Verifikation
 
-- ARM-Firmware erfolgreich kompiliert und gelinkt: 132308 Bytes QSPI.
-- DTCM 94076 / 131072 Bytes, AXI SRAM 152124 / 524288 Bytes.
+- ARM-Firmware mit Gate/Pegelmessung erfolgreich kompiliert und gelinkt: 133888 Bytes QSPI.
+- DTCM 94076 / 131072 Bytes, AXI SRAM 152364 / 524288 Bytes.
 - CRC und exportierte Gewichte gegen JSON geprueft.
 - C-Inferenz gegen unabhaengige NumPy-Faltungen mit Stille, Impuls und
   Rauschen ueber 20400 Samples geprueft: maximale Abweichung 3.84e-6.

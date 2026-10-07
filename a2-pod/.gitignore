@@ -1,0 +1,4 @@
+*.o
+*.dll
+test_noise_gate.exe
+__pycache__/
